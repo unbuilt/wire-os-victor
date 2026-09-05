@@ -1,6 +1,6 @@
 # Knowledge Graph Cloud Audio: OTA and Lycopod Test Runbook
 
-_Status: Implemented; main cloud-audio path confirmed on hardware with 104d; failure/interruption cases pending_
+_Status: 104d main path confirmed on hardware; upstream-integrated 105d built, hardware retest pending_
 
 _Last updated: 5 September 2026_
 
@@ -12,7 +12,7 @@ _Related document:_
 
 This runbook tests the Knowledge Graph cloud-audio feature end to end with:
 
-- WireOS OTA `_build/vicos-3.0.1.104d.ota`.
+- WireOS OTA `_build/vicos-3.0.1.105d.ota` (upstream integration).
 - The matching lycopod cloud-audio changes.
 - A development-signed OTA-capable Vector.
 - The robot and lycopod host on the same reachable network.
@@ -21,13 +21,17 @@ A passing test proves that lycopod generates answer audio, returns an `audio_id`
 serves progressive PCM over HTTP, and that Vector fetches and plays that audio
 instead of synthesizing the answer locally with Acapela.
 
-### Retesting after the 103d failure
+### Retesting the upstream integration
 
-Restart lycopod from the changed checkout and flash **104d**, not 103d.
-The server now yields the actual Knowledge Graph response instead of `None`.
-The new firmware also fixes the dedicated KG deadline, audio flow control,
-short clips, and failure reporting. Updating only one side does not include
-all of these fixes.
+Keep the already-working lycopod checkout and configuration unchanged and flash
+**105d**. This integrates upstream Victor through `c227d847` with the cloud-audio
+changes that worked in 104d. It preserves the KG deadline, playback flow control,
+short-clip handling, and failure reporting, while adopting upstream's ready-prompt
+fix and other updates.
+
+104d remains the hardware-confirmed fallback. The 103d failure also required
+the server fix that yields the actual Knowledge Graph response instead of
+`None`; testing against an older server still will not exercise the working path.
 
 Start `logcat` before saying "I have a question", then "How far away is the
 Sun?" Look for the new `Knowledge Graph response` and
@@ -53,24 +57,47 @@ Audio is raw 16 kHz, mono, signed 16-bit little-endian PCM. Lycopod serves it
 progressively using chunked HTTP transfer, so playback can begin after the first
 sentence while later sentences are still being generated.
 
-## 3. Known OTA artifact
+## 3. Known OTA artifacts
 
 From the WireOS repository root:
 
 ```bash
-ls -lh _build/vicos-3.0.1.104d.ota
-sha256sum _build/vicos-3.0.1.104d.ota
+ls -lh _build/vicos-3.0.1.105d.ota
+sha256sum _build/vicos-3.0.1.105d.ota
 ```
 
 Expected:
 
 ```text
-161843200 bytes
-3d9061a40ae8bd2cc95edb28781cf989bea5d31af430aeaaf4c56d96e3dfbb15  _build/vicos-3.0.1.104d.ota
+161976320 bytes
+d56463ce7ff6eb5faf013ec9ede4ab3334e0128fe928b261067cf903ef7f1779  _build/vicos-3.0.1.105d.ota
 ```
 
+105d was built from Victor merge commit
+`77a7881a6d686459f956bcb9f4ad297e4912988e`, with `EXTERNALS` pinned to
+`6aec7f1ddf341a898692768650fe945e334fb865`. Later documentation-only commits
+do not change the firmware in this artifact.
+
+The repositories use `origin` for `unbuilt/wire-os` and
+`unbuilt/wire-os-victor`, and `upstream` for the corresponding `os-vector`
+repositories. Both repositories preserve these branches:
+
+| Branch | Purpose |
+| --- | --- |
+| `feat/kg-cloud-audio` | Working baseline before incorporating newer upstream commits |
+| `integrate/kg-cloud-audio-upstream` | Upstream-integrated firmware used for 105d |
+
+The Victor baseline is `888ee2f9`; the matching WireOS baseline is `3db789c3d`.
+Publish the Victor branch before its matching WireOS branch: the parent records
+a specific Victor commit, not a moving branch.
+
+The unchanged fallback `_build/vicos-3.0.1.104d.ota` is 161843200 bytes with
+SHA-256 `3d9061a40ae8bd2cc95edb28781cf989bea5d31af430aeaaf4c56d96e3dfbb15`.
+Only its main cloud-audio path has been confirmed on hardware; the failure and
+interruption cases below still need dedicated hardware coverage.
+
 If the artifact is missing or the source has changed since it was generated,
-build a new increment instead of reusing `104`:
+build a new increment instead of reusing `105`:
 
 ```bash
 cd <wire-os-root>
@@ -124,7 +151,7 @@ Host <robot-ip>
 Do not enable legacy algorithms globally or disable host-key verification.
 This shared development key is not appropriate for an Internet-exposed robot.
 If `/etc/os-version` reports `0.9.3.0-Unlock`, the robot is running the unlock
-image, not OTA 104d; successful SSH alone does not establish that the update
+image, not OTA 105d; successful SSH alone does not establish that the update
 was installed.
 
 ```bash
@@ -304,7 +331,7 @@ ssh root@"$ROBOT_IP" 'systemctl restart vic-cloud'
 Hosts ending in `.anki.com` intentionally do not derive a cloud-audio endpoint.
 A robot still pointed at production will use local TTS.
 
-## 7. Flash OTA 104d
+## 7. Flash OTA 105d
 
 ### 7.1 Serve the OTA
 
@@ -319,7 +346,7 @@ Confirm the file is downloadable through the same address the robot will use:
 
 ```bash
 curl --fail --head \
-  "http://$SERVER_IP:$OTA_PORT/vicos-3.0.1.104d.ota"
+  "http://$SERVER_IP:$OTA_PORT/vicos-3.0.1.105d.ota"
 ```
 
 ### 7.2 Start the update
@@ -328,13 +355,13 @@ The robot must accept development-signed OTAs:
 
 ```bash
 ssh root@"$ROBOT_IP" \
-  "update-os http://$SERVER_IP:$OTA_PORT/vicos-3.0.1.104d.ota"
+  "update-os http://$SERVER_IP:$OTA_PORT/vicos-3.0.1.105d.ota"
 ```
 
 Alternatively, run this from the robot console:
 
 ```text
-ota-start http://<server-ip>:8000/vicos-3.0.1.104d.ota
+ota-start http://<server-ip>:8000/vicos-3.0.1.105d.ota
 ```
 
 Wait for the install and automatic reboot. Do not interrupt power.
@@ -351,7 +378,7 @@ done
 ssh root@"$ROBOT_IP" 'cat /etc/os-version; cat /anki/etc/version'
 ```
 
-The reported development version must identify build `104`. Do not rely only
+The reported development version must identify build `105`. Do not rely only
 on the downloaded filename: a cached version recipe can leave an incremental
 image reporting an earlier version.
 
@@ -635,10 +662,10 @@ ssh root@"$ROBOT_IP" \
   'cat /etc/os-version; sha256sum /anki/bin/vic-cloud'
 ```
 
-The daemon packaged in the corrected 104d system image has SHA-256:
+The daemon packaged in the upstream-integrated 105d system image has SHA-256:
 
 ```text
-5b50e5b710bc3a7fad6fbc81cd993b5fd05926ae9925aafc969c41ffc1735323
+416aedba897907b735656a92dde8e2c793762f3d73f8f123969c207018824c81
 ```
 
 That binary contains `maybeSendCloudAudio` and `VECTOR_KG_TTS_URL`. It is
@@ -675,8 +702,8 @@ If the response arrives too late, the HTTP fetch never starts. The separate
 after the gRPC response has been accepted; changing them does not fix this
 earlier failure.
 
-104d raises the dedicated cloud-audio KG budget to 60 seconds, and the engine
-waits 65 seconds. A nine-second timeout in the two-step interaction on 104d
+104d and 105d use a dedicated cloud-audio KG budget of 60 seconds, and the engine
+waits 65 seconds. A nine-second timeout in the two-step interaction on these builds
 suggests the cloud-audio endpoint is disabled/unresolved or the wrong daemon
 is running. Normal Intent Graph requests still have the nine-second budget.
 
@@ -773,7 +800,7 @@ Record one row per test:
 | Date/time | |
 | Robot ESN/name | |
 | Robot IP | |
-| OTA version | `3.0.1.104d` |
+| OTA version | `3.0.1.105d` |
 | OTA SHA-256 verified | yes / no |
 | Lycopod commit/tree state | |
 | Provider/model | |

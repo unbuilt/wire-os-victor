@@ -191,35 +191,31 @@ namespace Anki
       const auto &localeComponent = robotInfo.GetLocaleComponent();
       std::string readyText = localeComponent.GetString(_iVars.readyStringID);
 
-      // Remove ready for intent graph responses
       UserIntentComponent &uic = GetBehaviorComp<UserIntentComponent>();
       UserIntentPtr intentDataPtr = uic.GetUserIntentIfActive(USER_INTENT(knowledge_response_bypass));
-      if (intentDataPtr != nullptr)
-      {
-        readyText = "";
+
+      // Don't generate ready text for intent graph responses
+      if (intentDataPtr == nullptr) {
+        // start generating our ready text; if we fail, then we'll simply exit the behavior, and cry :(
+        if (!_readyTTSWrapper.SetUtteranceText(readyText, {})) {
+          PRINT_NAMED_WARNING("BehaviorKnowledgeGraphQuestion", "Failed to generate Ready TTS (%s)", readyText.c_str());
+          return;
+        }
+      } else {
+        PRINT_NAMED_WARNING("BehaviorKnowledgeGraphQuestion", "Not generating TTS as this is a intent graph response");
       }
 
-      const std::string &readyTextAddr = readyText;
-
-      // start generating our ready text; if we fail, then we'll simply exit the behavior, and cry :(
-      if (_readyTTSWrapper.SetUtteranceText(readyTextAddr, {}))
+      auto callback = [this]()
       {
-        auto callback = [this]()
-        {
-          // after our getin animation, we can prompt the user to speak
-          _dVars.state = EState::WaitingToStream;
+        // after our getin animation, we can prompt the user to speak
+        _dVars.state = EState::WaitingToStream;
 
-          // Need to loop this forever and we'll just cancel it on our own after a timeout
-          DelegateIfInControl(new ReselectingLoopAnimationAction(AnimationTrigger::KnowledgeGraphListening));
-        };
+        // Need to loop this forever and we'll just cancel it on our own after a timeout
+        DelegateIfInControl(new ReselectingLoopAnimationAction(AnimationTrigger::KnowledgeGraphListening));
+      };
 
-        // open up streaming after we play our get-in to avoid motor noise
-        DelegateIfInControl(new TriggerLiftSafeAnimationAction(AnimationTrigger::KnowledgeGraphGetIn), callback);
-      }
-      else
-      {
-        PRINT_NAMED_WARNING("BehaviorKnowledgeGraphQuestion", "Failed to generate Ready TTS (%s)", readyTextAddr.c_str());
-      }
+      // open up streaming after we play our get-in to avoid motor noise
+      DelegateIfInControl(new TriggerLiftSafeAnimationAction(AnimationTrigger::KnowledgeGraphGetIn), callback);
     }
 
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -276,8 +272,8 @@ namespace Anki
         // at this point our get in animation is complete, so as soon as the audio is finished playing we can transition in
         else if (EState::WaitingToStream == _dVars.state)
         {
-          // once we've finished speaking our ready text, we can start streaming
-          // hopefully the ready text is already finished by the time we even get into this state
+          // Bypass answers were handled above without opening another microphone stream.
+          // Prompted questions wait for the ready utterance before recording.
           if (_readyTTSWrapper.IsFinished())
           {
             BeginStreamingQuestion();

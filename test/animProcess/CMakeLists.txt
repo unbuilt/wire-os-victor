@@ -43,6 +43,7 @@ target_link_libraries(test_animprocess
 target_include_directories(test_animprocess 
   PRIVATE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../lib/audio/wwise/versions/current/include>
 )
 
 target_compile_definitions(test_animprocess 

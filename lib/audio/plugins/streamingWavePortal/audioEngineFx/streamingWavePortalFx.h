@@ -70,6 +70,7 @@ public:
   // Set a shared pointer to data instance
   using StreamingWaveDataInstance = Anki::AudioEngine::StreamingWaveDataInstance;
   void SetDataInstance( const std::shared_ptr<StreamingWaveDataInstance>& instance ) { _data = instance; }
+  const std::shared_ptr<StreamingWaveDataInstance>& GetDataInstance() const { return _data; }
 
   // Set plugin life cycle callback functions
   using PluginCallbackFunc = std::function<void( StreamingWavePortalFx* pluginInstance )>;

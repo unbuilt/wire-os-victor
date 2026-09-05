@@ -90,17 +90,9 @@ bool StreamingWaveDataInstance::WriteToPluginBuffer( AkAudioBuffer* inOut_buffer
 
 #if USE_AUDIO_ENGINE
 
+  inOut_buffer->uValidFrames = 0;
   if ( _bufferState == BufferState::Waiting ) {
     UpdateCurrentStream();
-    // Check updated state
-    if ( _bufferState == BufferState::Waiting ) {
-      // Still waiting
-      // NOTE: We are investigating why tts generator is taking so long to produce the last frame and reporting that it
-      //       is done producing data. Because of this, this log may show up in situations where we have completed
-      //       playing tts speech.
-      LOG_WARNING("StreamingWaveDataInstance.WriteToPluginBuffer", "No Data, plugin will be starved");
-      return false;
-    }
   }
 
   size_t bufferPlayhead = 0;
@@ -186,7 +178,7 @@ size_t StreamingWaveDataInstance::WriteContinuousData( AkAudioBuffer* inOut_buff
   memcpy( destination, source, sizeof(AkSampleType) * frameCount );
 
   _playheadIdx += frameCount;
-  _numberOfFramesPlayed += frameCount;
+  _numberOfFramesPlayed += static_cast<uint32_t>(frameCount);
 #endif
 
   return frameCount;

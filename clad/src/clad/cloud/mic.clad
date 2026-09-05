@@ -50,6 +50,51 @@ structure AudioData {
 	int_16 data[uint_16]
 }
 
+// Response-audio lifecycle (cloud -> engine). Used to stream cloud-generated
+// answer speech (e.g. Knowledge Graph) as chunked PCM instead of embedding it
+// in IntentResult parameters. See docs/development/knowledge_graph_cloud_audio_implementation_design.md
+enum uint_8 ResponseAudioEncoding {
+	Pcm16Le,
+	Opus
+}
+
+enum uint_8 ResponseAudioErrorType {
+	Provider,
+	InvalidFormat,
+	TooLarge,
+	Timeout,
+	Cancelled,
+	Transport
+}
+
+structure ResponseAudioStart {
+	string responseId,
+	ResponseAudioEncoding encoding,
+	uint_32 sampleRateHz,
+	uint_8 channels,
+	uint_32 totalFrames,
+	bool totalFramesKnown
+}
+
+// data payload must be capped at 1024 bytes by the sender so the packed
+// message stays below the 4096-byte engine receive buffer.
+structure ResponseAudioChunk {
+	string responseId,
+	uint_32 sequenceNumber,
+	uint_8 data[uint_16]
+}
+
+structure ResponseAudioEnd {
+	string responseId,
+	uint_32 finalSequenceNumber
+}
+
+structure ResponseAudioError {
+	string responseId,
+	ResponseAudioErrorType error,
+	string details
+}
+
 structure IntentResult {
 	string intent,
 	string[uint_16] parameters,
@@ -85,7 +130,13 @@ union dupes_allowed Message {
 	Filename debugFile,
 	IntentResult result,
 	IntentError error,
-	StreamOpen streamOpen
+	StreamOpen streamOpen,
+
+	// cloud -> engine: response-audio lifecycle
+	ResponseAudioStart responseAudioStart,
+	ResponseAudioChunk responseAudioChunk,
+	ResponseAudioEnd responseAudioEnd,
+	ResponseAudioError responseAudioError
 }
 
 

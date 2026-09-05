@@ -130,8 +130,12 @@ void StreamingWavePortalPlugIn::SetupEnginePlugInFx( StreamingWavePortalFx* plug
     {
       std::lock_guard<std::mutex> lock(_dataInstanceMutex);
       const auto findIt = _dataInstanceMap.find( pluginInstance->GetPluginId() );
-      if ( findIt != _dataInstanceMap.end() ) {
-        findIt->second->SetIsPluginActive( false );
+      const auto& dataInstance = pluginInstance->GetDataInstance();
+      if (dataInstance) {
+        dataInstance->SetIsPluginActive(false);
+      }
+      // A cancelled stream may terminate after a replacement has been prepared with the same ID.
+      if ( findIt != _dataInstanceMap.end() && findIt->second == dataInstance ) {
         _dataInstanceMap.erase(findIt);
       }
     }

@@ -64,7 +64,9 @@ structure UserIntent_PlaybackMessage
 structure UserIntent_KnowledgeResponse
 {
   string answer,
-  string query_text
+  string query_text,
+  string response_id,
+  bool cloud_audio_available
 }
 
 structure UserIntent_GlobalStop

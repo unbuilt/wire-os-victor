@@ -223,6 +223,7 @@ Result AnimEngine::Update(const BaseStationTime_t currTime_nanosec)
     // Tick the Audio Engine at the end of each anim frame
     _audioControllerPtr->Update();
   }
+  _sdkAudioComponent->Update();
 
   // Update backpack lights
   _context->GetBackpackLightComponent()->Update();

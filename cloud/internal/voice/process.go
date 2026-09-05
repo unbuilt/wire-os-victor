@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/digital-dream-labs/vector-cloud/internal/clad/cloud"
@@ -31,6 +32,8 @@ const (
 	SampleBits = 16
 	// DefaultTimeout is the length of time before the process will cancel a voice request
 	DefaultTimeout = 9 * time.Second
+	// Includes microphone capture and waiting for the first synthesized answer.
+	KnowledgeGraphTimeout = 60 * time.Second
 )
 
 // Process contains the data associated with an instance of the cloud process,
@@ -42,6 +45,9 @@ type Process struct {
 	kill      chan struct{}
 	msg       chan messageEvent
 	opts      options
+	// writeMu serializes writeResponse so the cloud-audio goroutine and the main
+	// process loop don't interleave datagram writes to the engine socket.
+	writeMu sync.Mutex
 }
 
 // AddReceiver adds the given Receiver to the list of sources the
@@ -203,7 +209,7 @@ procloop:
 					continue
 				}
 
-				chipperOpts := p.defaultChipperOptions()
+				chipperOpts := p.defaultChipperOptions(mode)
 				chipperOpts.SaveAudio = p.opts.saveAudio
 				chipperOpts.Language = language
 				chipperOpts.NoDas = hw.NoLogging
@@ -259,7 +265,7 @@ procloop:
 					}
 				}
 
-				chipperOpts := p.defaultChipperOptions()
+				chipperOpts := p.defaultChipperOptions(cloud.StreamType_Normal)
 				connectOpts := chipper.ConnectOpts{
 					StreamOpts:        chipperOpts,
 					TotalAudioMs:      DefaultAudioLenMs,
@@ -281,6 +287,11 @@ procloop:
 
 			// send intent to AI
 			p.writeResponse(cloud.NewMessageWithResult(intent.result))
+
+			// If this was a Knowledge Graph answer advertising cloud audio, fetch
+			// and stream the synthesized PCM to the engine asynchronously so the
+			// mic-stop / stream-close lifecycle below is unaffected.
+			p.maybeSendCloudAudio(intent.result)
 
 			// stop streaming until we get another hotword event
 			if err := strm.Close(); err != nil {
@@ -364,14 +375,18 @@ func SetVerbose(value bool) {
 	stream.SetVerbose(value)
 }
 
-func (p *Process) defaultChipperOptions() chipper.StreamOpts {
+func (p *Process) defaultChipperOptions(mode cloud.StreamType) chipper.StreamOpts {
+	timeout := DefaultTimeout
+	if mode == cloud.StreamType_KnowledgeGraph && config.KGCloudAudioURL() != "" {
+		timeout = KnowledgeGraphTimeout
+	}
 	return chipper.StreamOpts{
 		CompressOpts: chipper.CompressOpts{
 			Compress:   p.opts.compress,
 			Bitrate:    66 * 1024,
 			Complexity: 0,
 			FrameSize:  60},
-		Timeout: DefaultTimeout,
+		Timeout: timeout,
 	}
 }
 
@@ -389,6 +404,8 @@ func (p *Process) writeError(reason cloud.ErrorType, err error) {
 }
 
 func (p *Process) writeResponse(response *cloud.Message) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
 	for _, r := range p.intents {
 		err := r.Send(response)
 		if err != nil {

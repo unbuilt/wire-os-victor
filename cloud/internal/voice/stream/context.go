@@ -9,11 +9,13 @@ import (
 	"time"
 
 	"github.com/digital-dream-labs/vector-cloud/internal/clad/cloud"
+	"github.com/digital-dream-labs/vector-cloud/internal/config"
 
 	"github.com/digital-dream-labs/vector-cloud/internal/log"
 	"github.com/digital-dream-labs/vector-cloud/internal/util"
 
 	"github.com/digital-dream-labs/api-clients/chipper"
+	"github.com/google/uuid"
 )
 
 func (strm *Streamer) sendAudio(samples []byte) error {
@@ -155,10 +157,30 @@ func sendIntentResponse(resp *chipper.IntentResult, receiver Receiver) {
 
 func sendKGResponse(resp *chipper.KnowledgeGraphResponse, receiver Receiver, bypass bool) {
 	var buf bytes.Buffer
-	params := map[string]string{
-		"answer":      resp.SpokenText,
-		"answer_type": resp.CommandType,
-		"query_text":  resp.QueryText,
+	// Cloud audio: when an answer-audio endpoint is configured we advertise that
+	// cloud-generated speech will follow so the robot can prefer it over local
+	// TTS. A response id correlates the ResponseAudio* stream with this answer.
+	//
+	// AudioId is the server's handle for audio it has already produced for this
+	// answer; when present vic-cloud fetches it directly instead of asking for
+	// synthesis, so the robot needs no TTS provider configuration of its own.
+	// The field type is a real JSON bool (params is map[string]interface{}) so
+	// the engine's CLAD SetFromJSON can parse it with asBool().
+	cloudAudioAvailable := config.KGCloudAudioURL() != "" &&
+		(resp.AudioId != "" || resp.SpokenText != "")
+	responseID := ""
+	if cloudAudioAvailable {
+		responseID = uuid.New().String()
+	}
+	log.Printf("Knowledge Graph response: audio_id_present=%t cloud_audio_available=%t response_id=%s\n",
+		resp.AudioId != "", cloudAudioAvailable, responseID)
+	params := map[string]interface{}{
+		"answer":                resp.SpokenText,
+		"answer_type":           resp.CommandType,
+		"query_text":            resp.QueryText,
+		"response_id":           responseID,
+		"audio_id":              resp.AudioId,
+		"cloud_audio_available": cloudAudioAvailable,
 	}
 	for i, d := range resp.DomainsUsed {
 		params[fmt.Sprintf("domains.%d", i)] = d

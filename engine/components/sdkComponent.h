@@ -78,6 +78,16 @@ public:
   void HandleMessage(const T& msg);
   void EnableCameraAutoExposure(bool enable = true);
 
+  // Streaming audio playback to the robot speaker. These mirror the gateway-driven
+  // ExternalAudioStream* handlers but can be driven directly by engine behaviors
+  // (e.g. Knowledge Graph cloud audio). Audio is 16-bit little-endian PCM; chunks
+  // must be <= 1024 bytes. Playback auto-starts in the anim process after a short
+  // prebuffer and reports completion via audioStreamStatusEvent.
+  void PrepareStreamingAudio(uint16_t audioRate, uint16_t audioVolume);
+  void SendStreamingAudioChunk(const uint8_t* data, uint16_t sizeBytes);
+  void CompleteStreamingAudio();
+  void CancelStreamingAudio();
+
 private:
 
   Robot* _robot = nullptr;  

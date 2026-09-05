@@ -1145,7 +1145,200 @@ void UserIntentComponent::OnCloudData(CloudMic::Message&& data)
   LOG_DEBUG("UserIntentComponent.OnCloudData", "'%s'", CloudMic::MessageTagToString(data.GetTag()) );
 
   std::lock_guard<std::mutex> lock{_mutex};
+
+  switch ( data.GetTag() ) {
+    case CloudMic::MessageTag::responseAudioStart:
+    case CloudMic::MessageTag::responseAudioChunk:
+    case CloudMic::MessageTag::responseAudioEnd:
+    case CloudMic::MessageTag::responseAudioError:
+      // Response audio is buffered separately so it doesn't clobber the pending
+      // intent result (which lives in a single-slot member drained each tick).
+      HandleCloudResponseAudio(data);
+      return;
+
+    default:
+      break;
+  }
+
   _pendingCloudIntent = std::move(data);
+}
+
+namespace {
+  // Guard rails for cloud response audio buffering.
+  // Matches the cap vic-cloud applies to a single answer; keeping them equal means a
+  // long answer is rejected at one end only, not silently truncated at the other.
+  constexpr uint32_t kCloudAudioMaxBytes = 16000 * 2 * 60; // ~60s of 16kHz mono s16le
+}
+
+void UserIntentComponent::HandleCloudResponseAudio(const CloudMic::Message& data)
+{
+  // Caller holds _mutex.
+  switch ( data.GetTag() ) {
+    case CloudMic::MessageTag::responseAudioStart:
+    {
+      const auto& start = data.Get_responseAudioStart();
+      // A fetch for a previous answer can still be in flight; ignore it so it can't
+      // wipe out the audio for the answer the behavior is actually waiting on.
+      if ( !_cloudAudioExpectedId.empty() && start.responseId != _cloudAudioExpectedId ) {
+        LOG_INFO("UserIntentComponent.CloudAudio.IgnoringStaleStart",
+                 "responseId=%s expected=%s", start.responseId.c_str(), _cloudAudioExpectedId.c_str());
+        break;
+      }
+      _cloudAudio.Reset();
+      _cloudAudio.responseId   = start.responseId;
+      _cloudAudio.haveStart    = true;
+      _cloudAudio.sampleRateHz = start.sampleRateHz;
+      _cloudAudio.channels     = start.channels;
+      _cloudAudio.nextSequence = 0;
+      LOG_INFO("UserIntentComponent.CloudAudio.Start",
+               "responseId=%s rate=%u ch=%u", start.responseId.c_str(),
+               start.sampleRateHz, (uint32_t)start.channels);
+      break;
+    }
+
+    case CloudMic::MessageTag::responseAudioChunk:
+    {
+      const auto& chunk = data.Get_responseAudioChunk();
+      if ( !_cloudAudio.haveStart || _cloudAudio.hasError || _cloudAudio.complete ||
+           chunk.responseId != _cloudAudio.responseId ) {
+        break;
+      }
+      if ( chunk.sequenceNumber != _cloudAudio.nextSequence ) {
+        LOG_WARNING("UserIntentComponent.CloudAudio.SeqGap",
+                    "responseId=%s expected seq %u got %u",
+                    chunk.responseId.c_str(), _cloudAudio.nextSequence, chunk.sequenceNumber);
+        _cloudAudio.hasError = true;
+        break;
+      }
+      // Cap on the whole answer, not just what is currently buffered: audio is
+      // drained as it plays, so the buffer itself stays small.
+      if ( _cloudAudio.totalBytes + chunk.data.size() > kCloudAudioMaxBytes ) {
+        LOG_WARNING("UserIntentComponent.CloudAudio.TooLarge",
+                    "responseId=%s exceeded max buffer", chunk.responseId.c_str());
+        _cloudAudio.hasError = true;
+        break;
+      }
+      _cloudAudio.pcm.insert(_cloudAudio.pcm.end(), chunk.data.begin(), chunk.data.end());
+      _cloudAudio.totalBytes += chunk.data.size();
+      _cloudAudio.nextSequence++;
+      break;
+    }
+
+    case CloudMic::MessageTag::responseAudioEnd:
+    {
+      const auto& end = data.Get_responseAudioEnd();
+      if ( !_cloudAudio.haveStart || end.responseId != _cloudAudio.responseId ) {
+        break;
+      }
+      if ( _cloudAudio.hasError ) {
+        break;
+      }
+      _cloudAudio.complete = true;
+      LOG_INFO("UserIntentComponent.CloudAudio.End",
+               "responseId=%s bytes=%zu chunks=%u", end.responseId.c_str(),
+               _cloudAudio.totalBytes, _cloudAudio.nextSequence);
+      break;
+    }
+
+    case CloudMic::MessageTag::responseAudioError:
+    {
+      const auto& err = data.Get_responseAudioError();
+      if ( !_cloudAudioExpectedId.empty() && err.responseId != _cloudAudioExpectedId ) {
+        break;
+      }
+      if ( _cloudAudio.haveStart && err.responseId != _cloudAudio.responseId ) {
+        break;
+      }
+      // Record the error against the advertised responseId so the behavior can
+      // observe it even if no Start ever arrived.
+      if ( !_cloudAudio.haveStart ) {
+        _cloudAudio.responseId = err.responseId;
+      }
+      _cloudAudio.hasError = true;
+      LOG_WARNING("UserIntentComponent.CloudAudio.Error",
+                  "responseId=%s details=%s", err.responseId.c_str(), err.details.c_str());
+      break;
+    }
+
+    default:
+      break;
+  }
+}
+
+bool UserIntentComponent::IsCloudAudioReady(const std::string& responseId,
+                                            uint32_t& sampleRateHz, uint8_t& channels,
+                                            size_t minBytes)
+{
+  std::lock_guard<std::mutex> lock{_mutex};
+  if ( _cloudAudio.responseId != responseId || _cloudAudio.hasError || _cloudAudio.pcm.empty() ) {
+    return false;
+  }
+  // Enough audio to start on, or everything there will ever be. Waiting for the
+  // full answer isn't an option: the cloud produces it sentence by sentence.
+  if ( _cloudAudio.pcm.size() < minBytes && !_cloudAudio.complete ) {
+    return false;
+  }
+  sampleRateHz = _cloudAudio.sampleRateHz;
+  channels = _cloudAudio.channels;
+  return true;
+}
+
+bool UserIntentComponent::HasCloudAudioError(const std::string& responseId)
+{
+  std::lock_guard<std::mutex> lock{_mutex};
+  return _cloudAudio.responseId == responseId && _cloudAudio.hasError;
+}
+
+bool UserIntentComponent::HasCloudAudioStarted(const std::string& responseId)
+{
+  std::lock_guard<std::mutex> lock{_mutex};
+  return _cloudAudio.responseId == responseId && _cloudAudio.haveStart;
+}
+
+bool UserIntentComponent::IsCloudAudioComplete(const std::string& responseId)
+{
+  std::lock_guard<std::mutex> lock{_mutex};
+  return _cloudAudio.responseId == responseId && _cloudAudio.complete;
+}
+
+size_t UserIntentComponent::GetCloudAudioPendingBytes(const std::string& responseId)
+{
+  std::lock_guard<std::mutex> lock{_mutex};
+  return ( _cloudAudio.responseId == responseId ) ? _cloudAudio.pcm.size() : 0;
+}
+
+std::vector<uint8_t> UserIntentComponent::ConsumeCloudAudioPcm(const std::string& responseId)
+{
+  std::lock_guard<std::mutex> lock{_mutex};
+  if ( _cloudAudio.responseId != responseId || _cloudAudio.hasError || _cloudAudio.pcm.empty() ) {
+    return {};
+  }
+  // Hand out whole 16-bit frames only; a trailing half sample waits for the rest
+  // of its chunk rather than being played as noise.
+  const size_t wholeFrames = _cloudAudio.pcm.size() - ( _cloudAudio.pcm.size() % 2 );
+  if ( wholeFrames == 0 ) {
+    return {};
+  }
+  std::vector<uint8_t> pcm( _cloudAudio.pcm.begin(), _cloudAudio.pcm.begin() + wholeFrames );
+  _cloudAudio.pcm.erase( _cloudAudio.pcm.begin(), _cloudAudio.pcm.begin() + wholeFrames );
+  return pcm;
+}
+
+void UserIntentComponent::SetExpectedCloudAudioResponse(const std::string& responseId)
+{
+  std::lock_guard<std::mutex> lock{_mutex};
+  _cloudAudioExpectedId = responseId;
+  // Anything buffered for a different answer belongs to a stale fetch.
+  if ( !responseId.empty() && _cloudAudio.haveStart && _cloudAudio.responseId != responseId ) {
+    _cloudAudio.Reset();
+  }
+}
+
+void UserIntentComponent::ClearCloudAudio()
+{
+  std::lock_guard<std::mutex> lock{_mutex};
+  _cloudAudio.Reset();
+  _cloudAudioExpectedId.clear();
 }
 
 void UserIntentComponent::OnAppIntent(const ExternalInterface::AppIntent& appIntent )

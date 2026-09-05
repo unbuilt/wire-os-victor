@@ -56,6 +56,11 @@ set(GATEWAY_PROTO_SRCS "${GATEWAY_PROTO_SRCS}" PARENT_SCOPE)
 set(PROTOBUF_OUTPUT_DIR "${PROTOBUF_OUTPUT_DIR}" PARENT_SCOPE)
 set(GATEWAY_PROTO_HOME_DIR "${GATEWAY_PROTO_HOME_DIR}" PARENT_SCOPE)
 
+# The entry-point directory alone does not cover changes to imported packages.
+file(GLOB_RECURSE CLOUD_INTERNAL_SRCS CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/internal/*.go"
+)
+
 anki_build_go(
   NAME         vic-cloud
   DIR          "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -64,6 +69,7 @@ anki_build_go(
   LINK_FLAGS   "${OPUS_LIBS}"
   PKG_CONFIG_PATHS "${OPUS_PKGCONFIG}"
   BUILD_TAGS "vicos nolibopusfile"
+  EXTRA_DEPENDS ${CLOUD_INTERNAL_SRCS}
 )
 
 set(PROTO_SRC_DIR "${GATEWAY_PROTO_HOME_DIR}/public")

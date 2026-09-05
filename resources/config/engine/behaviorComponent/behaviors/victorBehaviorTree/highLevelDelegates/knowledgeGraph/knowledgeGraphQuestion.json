@@ -14,5 +14,11 @@
   "streamingTimeout"        : 10.0,
   "earConAudioEventEnd"     : "Play__Robot_Vic_Sfx__Wake_Word_Success",
 
+  "cloudAudioEnabled"           : true,
+  "cloudAudioRequestTimeout"    : 65.0,
+  "cloudAudioReadyTimeout"      : 20.0,
+  "cloudAudioFallbackToLocalTts": true,
+  "cloudAudioVolume"            : 100,
+
   "postBehaviorSuggestion": "Socialize"
 }

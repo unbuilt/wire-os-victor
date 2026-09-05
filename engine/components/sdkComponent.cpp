@@ -798,6 +798,54 @@ void SDKComponent::HandleAudioStreamCancelRequest(const AnkiEvent<external_inter
   }
 }
 
+void SDKComponent::PrepareStreamingAudio(uint16_t audioRate, uint16_t audioVolume)
+{
+  RobotInterface::ExternalAudioPrepare msg;
+  msg.audio_volume = audioVolume;
+  msg.audio_rate = audioRate;
+
+  const Result result = _robot->SendMessage(RobotInterface::EngineToRobot(std::move(msg)));
+  if (RESULT_OK != result) {
+    LOG_ERROR("SDKComponent.PrepareStreamingAudio", "Send Prepare Audio Streaming Message to Robot failed");
+  }
+}
+
+void SDKComponent::SendStreamingAudioChunk(const uint8_t* data, uint16_t sizeBytes)
+{
+  if (!ANKI_VERIFY(sizeBytes <= 1024,
+        "SDKComponent.SendStreamingAudioChunk", "Invalid audio playback chunk size %u", sizeBytes)) {
+    return;
+  }
+
+  RobotInterface::ExternalAudioChunk msg;
+  msg.audio_chunk_size = sizeBytes;
+  msg.audio_chunk_data.fill(0);
+  std::memcpy(msg.audio_chunk_data.data(), data, sizeBytes);
+
+  const Result result = _robot->SendMessage(RobotInterface::EngineToRobot(std::move(msg)));
+  if (RESULT_OK != result) {
+    LOG_ERROR("SDKComponent.SendStreamingAudioChunk", "Send Audio Stream Chunk Message to Robot failed");
+  }
+}
+
+void SDKComponent::CompleteStreamingAudio()
+{
+  RobotInterface::ExternalAudioComplete msg;
+  const Result result = _robot->SendMessage(RobotInterface::EngineToRobot(std::move(msg)));
+  if (RESULT_OK != result) {
+    LOG_ERROR("SDKComponent.CompleteStreamingAudio", "Send Audio Stream Complete Message to Robot failed");
+  }
+}
+
+void SDKComponent::CancelStreamingAudio()
+{
+  RobotInterface::ExternalAudioCancel msg;
+  const Result result = _robot->SendMessage(RobotInterface::EngineToRobot(std::move(msg)));
+  if (RESULT_OK != result) {
+    LOG_ERROR("SDKComponent.CancelStreamingAudio", "Send Audio Stream Cancel Message to Robot failed");
+  }
+}
+
 void SDKComponent::SetMasterVolume(const AnkiEvent<external_interface::GatewayWrapper>& event)
 {
   auto* gi = _robot->GetGatewayInterface();

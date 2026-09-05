@@ -53,6 +53,8 @@ public:
   void HandleMessage(const RobotInterface::ExternalAudioComplete& msg);
   void HandleMessage(const RobotInterface::ExternalAudioCancel& msg);
 
+  // Report playback progress from the anim main thread, even when no chunks arrive.
+  void Update();
 
 private:
   // -------------------------------------------------------------------------------------------------------------------
@@ -70,6 +72,7 @@ private:
   StreamingWaveDataPtr _waveData = nullptr;
   uint16_t  _audioRate;
   uint32_t  _totalAudioFramesReceived;
+  uint32_t  _lastAudioFramesPlayed = 0;
   bool      _audioPrepared;
   bool      _audioPosted;
   std::shared_ptr<AudioCallbackType> _audioPlaybackFinishedPtr;
@@ -82,6 +85,7 @@ private:
   bool PrepareAudioEngine(const RobotInterface::ExternalAudioPrepare& msg );
   bool AddAudioChunk(const RobotInterface::ExternalAudioChunk& msg );
   bool PostAudioEvent();    
+  void ReportProgress();
   void OnAudioCompleted();
   void StopActiveAudio();
   void ClearActiveAudio();

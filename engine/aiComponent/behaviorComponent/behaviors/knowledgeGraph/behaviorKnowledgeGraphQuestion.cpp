@@ -24,6 +24,13 @@
 #include "engine/aiComponent/behaviorComponent/userIntents.h"
 #include "engine/audio/engineRobotAudioClient.h"
 #include "engine/components/localeComponent.h"
+#include "engine/components/sdkComponent.h"
+#include "engine/actions/basicActions.h"
+#include "engine/robot.h"
+
+#include "clad/robotInterface/messageEngineToRobot.h"
+#include "clad/robotInterface/messageRobotToEngine.h"
+#include "clad/types/sdkAudioTypes.h"
 
 #include "coretech/common/engine/jsonTools.h"
 #include "coretech/common/engine/utils/timer.h"
@@ -31,6 +38,9 @@
 #include "util/global/globalDefinitions.h"
 #include "util/logging/logging.h"
 #include "clad/types/animationTrigger.h"
+
+#include <algorithm>
+#include <cstring>
 
 #define PRINT_DEBUG(format, ...) \
   PRINT_CH_DEBUG("KnowledgeGraph", "BehaviorKnowledgeGraphQuestion", format, ##__VA_ARGS__)
@@ -48,9 +58,33 @@ namespace Anki
       const char *kKey_Duration = "streamingTimeout";
       const char *kKey_ReadyStringID = "readyStringID";
       const char *kKey_EarConEnd = "earConAudioEventEnd";
+      const char *kKey_CloudAudioEnabled = "cloudAudioEnabled";
+      const char *kKey_CloudAudioRequestTimeout = "cloudAudioRequestTimeout";
+      const char *kKey_CloudAudioReadyTimeout = "cloudAudioReadyTimeout";
+      const char *kKey_CloudAudioFallback = "cloudAudioFallbackToLocalTts";
+      const char *kKey_CloudAudioVolume = "cloudAudioVolume";
 
       const double kDefaultDuration = 10.0;
       const char *kDefaultReadyStringID = "BehaviorKnowledgeGraphQuestion.Ready";
+
+      // Cloud audio pacing / playback tuning.
+      constexpr double kCloudAudioBufferAheadSec = 3.0;   // keep at most this much audio buffered in anim
+      constexpr double kCloudAudioCompletionGraceSec = 5.0;
+      constexpr uint16_t kCloudAudioMaxChunkBytes = 1024; // matches the anim streaming player limit
+      // The cloud synthesizes an answer sentence by sentence, so playback starts on a
+      // prebuffer rather than on the whole answer. 0.75s at 16kHz mono s16le.
+      constexpr size_t kCloudAudioPrebufferBytes = 24000;
+      // How long the answer may stall mid-stream before we treat it as finished. The
+      // anim player pads gaps with silence, so a stall is audible but not fatal.
+      constexpr double kCloudAudioStallTimeoutSec = 20.0;
+      // Control is held in slices while the answer streams, since its length is not
+      // known up front.
+      constexpr float kCloudAudioWaitSliceSec = 1.0f;
+      // Absolute cap on a single answer, in case the stream never ends.
+      constexpr double kCloudAudioMaxPlaybackSec = 90.0;
+      // Below this much played audio a broken answer is re-spoken locally rather
+      // than left truncated.
+      constexpr double kCloudAudioSalvageSec = 1.5;
     }
 
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -80,10 +114,25 @@ namespace Anki
         _iVars.earConEnd = AudioMetaData::GameEvent::GenericEventFromString(earConString);
       }
 
+      JsonTools::GetValueOptional(config, kKey_CloudAudioEnabled, _iVars.cloudAudioEnabled);
+      JsonTools::GetValueOptional(config, kKey_CloudAudioRequestTimeout, _iVars.cloudAudioRequestTimeout);
+      JsonTools::GetValueOptional(config, kKey_CloudAudioReadyTimeout, _iVars.cloudAudioReadyTimeout);
+      JsonTools::GetValueOptional(config, kKey_CloudAudioFallback, _iVars.cloudAudioFallbackToLocalTts);
+      {
+        int cloudAudioVolume = static_cast<int>(_iVars.cloudAudioVolume);
+        if (JsonTools::GetValueOptional(config, kKey_CloudAudioVolume, cloudAudioVolume))
+        {
+          _iVars.cloudAudioVolume = static_cast<uint32_t>(cloudAudioVolume);
+        }
+      }
+
       SubscribeToTags({{
           ExternalInterface::MessageEngineToGameTag::TouchButtonEvent,
           ExternalInterface::MessageEngineToGameTag::RobotFallingEvent, // do we need this?
       }});
+
+      // cloud-audio playback status is reported by the anim process
+      SubscribeToTags({RobotInterface::RobotToEngineTag::audioStreamStatusEvent});
     }
 
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -92,6 +141,11 @@ namespace Anki
       expectedKeys.insert(kKey_Duration);
       expectedKeys.insert(kKey_ReadyStringID);
       expectedKeys.insert(kKey_EarConEnd);
+      expectedKeys.insert(kKey_CloudAudioEnabled);
+      expectedKeys.insert(kKey_CloudAudioRequestTimeout);
+      expectedKeys.insert(kKey_CloudAudioReadyTimeout);
+      expectedKeys.insert(kKey_CloudAudioFallback);
+      expectedKeys.insert(kKey_CloudAudioVolume);
     }
 
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -173,6 +227,12 @@ namespace Anki
     {
       // make sure we cancel the ready utterance if we bail during it playing
       _readyTTSWrapper.CancelUtterance();
+
+      // if we were streaming cloud audio and didn't finish cleanly, stop it and drop the buffer
+      if (EResponseSource::CloudAudio == _dVars.responseSource && !_dVars.cloudAudioResponseFinished)
+      {
+        CancelCloudAudioPlayback();
+      }
     }
 
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -207,14 +267,11 @@ namespace Anki
         UserIntentPtr intentDataPtr = uic.GetUserIntentIfActive(USER_INTENT(knowledge_response_bypass));
 
         // Enter if the a knowledge response was returned and activated
-        if (intentDataPtr != nullptr)
+        if (intentDataPtr != nullptr && EState::WaitingToStream == _dVars.state)
         {
-          if (EState::WaitingToStream == _dVars.state)
-          {
-            CancelDelegates(false);
-            // This skips over the streaming because the results were alreday returned
-            OnStreamingComplete(true);
-          }
+          CancelDelegates(false);
+          // This skips over the streaming because the results were alreday returned
+          OnStreamingComplete(true);
         }
         // at this point our get in animation is complete, so as soon as the audio is finished playing we can transition in
         else if (EState::WaitingToStream == _dVars.state)
@@ -245,8 +302,11 @@ namespace Anki
             _dVars.streamingBeginTime = currentTime;
           }
 
+          const double requestTimeout = _iVars.cloudAudioEnabled
+            ? std::max(_iVars.streamingDuration, _iVars.cloudAudioRequestTimeout)
+            : _iVars.streamingDuration;
           const bool timeIsUp = (!FLT_NEAR(_dVars.streamingBeginTime, 0.f)) &&
-                                (currentTime >= (_dVars.streamingBeginTime + _iVars.streamingDuration));
+                                (currentTime >= (_dVars.streamingBeginTime + requestTimeout));
           if (IsResponsePending() || timeIsUp)
           {
             CancelDelegates(false);
@@ -255,6 +315,12 @@ namespace Anki
         }
         else if (EState::Responding == _dVars.state)
         {
+          // pace any remaining cloud audio out to the anim process
+          if (EResponseSource::CloudAudio == _dVars.responseSource)
+          {
+            UpdateCloudAudioStreaming();
+          }
+
           const bool isPickedUp = GetBEI().GetRobotInfo().IsPickedUp();
 
           // if we're playing our response, allow victor to be interrupted
@@ -302,6 +368,20 @@ namespace Anki
       if (!_dVars.responseString.empty())
       {
         PRINT_INFO("Streaming is complete ... valid response received");
+
+        // decide whether to play cloud-synthesized audio or synthesize locally
+        if (ShouldUseCloudAudio())
+        {
+          _dVars.responseSource = EResponseSource::CloudAudio;
+          const double now = BaseStationTimer::getInstance()->GetCurrentTimeInSecondsDouble();
+          _dVars.cloudAudioReadyDeadline = now + _iVars.cloudAudioReadyTimeout;
+          PRINT_INFO("Cloud audio expected for response %s (waiting up to %.1fs)",
+                     _dVars.responseId.c_str(), _iVars.cloudAudioReadyTimeout);
+        }
+        else
+        {
+          _dVars.responseSource = EResponseSource::LocalTts;
+        }
 
         // start generating the response now so that we can minimize the wait time
         auto callback = [this](bool success)
@@ -362,6 +442,11 @@ namespace Anki
         // grab the response string
         const UserIntent_KnowledgeResponse &intentResponse = intent.Get_knowledge_response();
         _dVars.responseString = intentResponse.answer;
+        _dVars.responseId = intentResponse.response_id;
+        _dVars.cloudAudioExpected = intentResponse.cloud_audio_available;
+        // Pin the audio buffer to this answer so a still-in-flight fetch for the
+        // previous one cannot overwrite it.
+        uic.SetExpectedCloudAudioResponse(_dVars.responseId);
 
         PRINT_DEBUG("Knowledge Graph Question: %s", Util::HidePersonallyIdentifiableInfo(intentResponse.query_text.c_str()));
         PRINT_DEBUG("Knowledge Graph Response: %s", Util::HidePersonallyIdentifiableInfo(intentResponse.answer.c_str()));
@@ -402,6 +487,9 @@ namespace Anki
       const UserIntent_KnowledgeResponse &intentResponse = intentDataPtr->intent.Get_knowledge_response();
 
       _dVars.responseString = intentResponse.answer;
+      _dVars.responseId = intentResponse.response_id;
+      _dVars.cloudAudioExpected = intentResponse.cloud_audio_available;
+      uic.SetExpectedCloudAudioResponse(_dVars.responseId);
 
       PRINT_DEBUG("Intent Graph Question: %s", Util::HidePersonallyIdentifiableInfo(intentResponse.query_text.c_str()));
       PRINT_DEBUG("Intent Graph Response: %s", Util::HidePersonallyIdentifiableInfo(intentResponse.answer.c_str()));
@@ -434,6 +522,57 @@ namespace Anki
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
     void BehaviorKnowledgeGraphQuestion::TransitionToSearchingLoop()
     {
+      // If this response is using cloud audio, loop the searching anim until the PCM
+      // stream is ready, then transition out. On error/timeout, fall back to local TTS.
+      if (EResponseSource::CloudAudio == _dVars.responseSource)
+      {
+        UserIntentComponent &uic = GetBehaviorComp<UserIntentComponent>();
+        uint32_t sampleRate = 0;
+        uint8_t channels = 0;
+        const double now = BaseStationTimer::getInstance()->GetCurrentTimeInSecondsDouble();
+
+        if (uic.IsCloudAudioReady(_dVars.responseId, sampleRate, channels, kCloudAudioPrebufferBytes))
+        {
+          _dVars.cloudAudioSampleRate = sampleRate;
+          _dVars.cloudAudioChannels = channels;
+          PRINT_INFO("Cloud audio ready for %s (%u Hz, %u ch)", _dVars.responseId.c_str(), sampleRate, channels);
+          DelegateIfInControl(new TriggerLiftSafeAnimationAction(AnimationTrigger::KnowledgeGraphSearchingGetOutSuccess),
+                              &BehaviorKnowledgeGraphQuestion::TransitionToBeginResponse);
+          return;
+        }
+
+        const bool hadError = uic.HasCloudAudioError(_dVars.responseId);
+        const bool timedOut = (now >= _dVars.cloudAudioReadyDeadline);
+        if (hadError || timedOut)
+        {
+          PRINT_INFO("Cloud audio unavailable for %s (%s); falling back",
+                     _dVars.responseId.c_str(), hadError ? "error" : "timeout");
+          uic.ClearCloudAudio();
+
+          if (_iVars.cloudAudioFallbackToLocalTts)
+          {
+            // fall through to the local-tts wait below
+            _dVars.responseSource = EResponseSource::LocalTts;
+          }
+          else
+          {
+            // give up: play the searching fail get-out
+            CompoundActionSequential *failAnim = new CompoundActionSequential();
+            failAnim->AddAction(new TriggerLiftSafeAnimationAction(AnimationTrigger::KnowledgeGraphSearchingFail), true);
+            failAnim->AddAction(new TriggerLiftSafeAnimationAction(AnimationTrigger::KnowledgeGraphSearchingFailGetOut), true);
+            DelegateIfInControl(failAnim);
+            return;
+          }
+        }
+        else
+        {
+          // still waiting on the PCM stream: keep looping the searching anim
+          DelegateIfInControl(new TriggerLiftSafeAnimationAction(AnimationTrigger::KnowledgeGraphSearching),
+                              &BehaviorKnowledgeGraphQuestion::TransitionToSearchingLoop);
+          return;
+        }
+      }
+
       // keep looping back here until the tts audio has been generated ...
       if (EGenerationStatus::None != _dVars.ttsGenerationStatus)
       {
@@ -471,8 +610,15 @@ namespace Anki
 
       _dVars.wasPickedUp = GetBEI().GetRobotInfo().IsPickedUp();
 
-      // nothing to do but speak the response
-      BeginResponseTTS();
+      // speak the response, either as cloud-synthesized audio or via local TTS
+      if (EResponseSource::CloudAudio == _dVars.responseSource)
+      {
+        BeginResponseCloudAudio();
+      }
+      else
+      {
+        BeginResponseTTS();
+      }
     }
 
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -499,9 +645,340 @@ namespace Anki
       PRINT_INFO("Interruption event received, cancelling TTS");
 
       _dVars.state = EState::Interrupted;
-      if (IsControlDelegated() && _iVars.ttsBehavior.get()->IsActivated())
+
+      if (EResponseSource::CloudAudio == _dVars.responseSource)
+      {
+        CancelCloudAudioPlayback();
+      }
+      else if (IsControlDelegated() && _iVars.ttsBehavior.get()->IsActivated())
       {
         _iVars.ttsBehavior.get()->Interrupt(false);
+      }
+    }
+
+    // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    bool BehaviorKnowledgeGraphQuestion::ShouldUseCloudAudio() const
+    {
+      return _iVars.cloudAudioEnabled && _dVars.cloudAudioExpected && !_dVars.responseId.empty();
+    }
+
+    // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    void BehaviorKnowledgeGraphQuestion::BeginResponseCloudAudio()
+    {
+      UserIntentComponent &uic = GetBehaviorComp<UserIntentComponent>();
+      _dVars.cloudAudioPcm = uic.ConsumeCloudAudioPcm(_dVars.responseId);
+
+      if (_dVars.cloudAudioPcm.empty())
+      {
+        // shouldn't happen (we only get here once IsCloudAudioReady was true), but be safe
+        PRINT_NAMED_WARNING("BehaviorKnowledgeGraphQuestion", "Cloud audio buffer empty at playback; falling back");
+        if (_iVars.cloudAudioFallbackToLocalTts)
+        {
+          _dVars.responseSource = EResponseSource::LocalTts;
+          BeginResponseTTS();
+        }
+        return;
+      }
+
+      const uint8_t channels = (_dVars.cloudAudioChannels > 0) ? _dVars.cloudAudioChannels : 1;
+      const uint32_t sampleRate = (_dVars.cloudAudioSampleRate > 0) ? _dVars.cloudAudioSampleRate : 16000;
+      _dVars.cloudAudioChannels = channels;
+      _dVars.cloudAudioSampleRate = sampleRate;
+      _dVars.cloudAudioPlayback = CloudAudioPlaybackState{};
+      _dVars.cloudAudioCompleteSent = false;
+      _dVars.cloudAudioResponseFinished = false;
+
+      // prepare the streaming player with the PCM format
+      GetBEI().GetRobotInfo().GetSDKComponent().PrepareStreamingAudio(
+          static_cast<uint16_t>(sampleRate), static_cast<uint16_t>(_iVars.cloudAudioVolume));
+
+      const double now = BaseStationTimer::getInstance()->GetCurrentTimeInSecondsDouble();
+      _dVars.cloudAudioStreamStartTime = now;
+      _dVars.cloudAudioLastDataTime = now;
+      _dVars.cloudAudioLastPlaybackProgressTime = now;
+
+      PRINT_INFO("Streaming cloud audio for %s starting with %zu buffered bytes",
+                 _dVars.responseId.c_str(), _dVars.cloudAudioPcm.size());
+
+      // The answer is still being synthesized, so its duration is unknown. Hold
+      // control in slices and re-arm until the stream really ends.
+      WaitOutCloudAudioPlayback();
+
+      // send an initial batch of chunks right away
+      UpdateCloudAudioStreaming();
+    }
+
+    // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    void BehaviorKnowledgeGraphQuestion::WaitOutCloudAudioPlayback()
+    {
+      if (_dVars.cloudAudioResponseFinished || EResponseSource::CloudAudio != _dVars.responseSource)
+      {
+        return;
+      }
+
+      const double now = BaseStationTimer::getInstance()->GetCurrentTimeInSecondsDouble();
+      // Success requires anim's Completed event. Time in a starved stream is
+      // silence, not played answer audio, and cannot establish completion.
+      if ((_dVars.cloudAudioCompleteSent && now >= _dVars.cloudAudioCompletionDeadline) ||
+          now - _dVars.cloudAudioStreamStartTime >= kCloudAudioMaxPlaybackSec)
+      {
+        PRINT_NAMED_WARNING("BehaviorKnowledgeGraphQuestion",
+                            "Cloud audio for %s timed out waiting for playback completion",
+                            _dVars.responseId.c_str());
+        FailCloudAudioResponse();
+        return;
+      }
+
+      DelegateIfInControl(new WaitAction(kCloudAudioWaitSliceSec), [this]() {
+        WaitOutCloudAudioPlayback();
+      });
+    }
+
+    // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    void BehaviorKnowledgeGraphQuestion::UpdateCloudAudioStreaming()
+    {
+      if (_dVars.cloudAudioResponseFinished)
+      {
+        return;
+      }
+
+      SDKComponent &sdk = GetBEI().GetRobotInfo().GetSDKComponent();
+      UserIntentComponent &uic = GetBehaviorComp<UserIntentComponent>();
+
+      const double now = BaseStationTimer::getInstance()->GetCurrentTimeInSecondsDouble();
+
+      // Pick up whatever the cloud has produced since the last tick. The answer
+      // arrives sentence by sentence, so this keeps running well after playback
+      // has started.
+      if (!_dVars.cloudAudioCompleteSent)
+      {
+        std::vector<uint8_t> more = uic.ConsumeCloudAudioPcm(_dVars.responseId);
+        if (!more.empty())
+        {
+          _dVars.cloudAudioPcm.insert(_dVars.cloudAudioPcm.end(), more.begin(), more.end());
+          _dVars.cloudAudioLastDataTime = now;
+        }
+      }
+
+      const uint8_t channels = (_dVars.cloudAudioChannels > 0) ? _dVars.cloudAudioChannels : 1;
+      const uint32_t sampleRate = (_dVars.cloudAudioSampleRate > 0) ? _dVars.cloudAudioSampleRate : 16000;
+      const double bytesPerSecond = static_cast<double>(sampleRate) * 2.0 * channels;
+
+      if (!_dVars.cloudAudioCompleteSent && !_dVars.cloudAudioFailed)
+      {
+        const bool failed = uic.HasCloudAudioError(_dVars.responseId);
+        const bool stalled = !uic.IsCloudAudioComplete(_dVars.responseId) &&
+          now - _dVars.cloudAudioLastDataTime >= kCloudAudioStallTimeoutSec;
+        if (failed || stalled)
+        {
+          _dVars.cloudAudioFailed = true;
+          PRINT_NAMED_WARNING("BehaviorKnowledgeGraphQuestion",
+                              "Cloud audio for %s %s after %.2fs played",
+                              _dVars.responseId.c_str(), failed ? "failed" : "stalled",
+                              static_cast<double>(_dVars.cloudAudioPlayback.FramesPlayed()) / sampleRate);
+          if (static_cast<double>(_dVars.cloudAudioPlayback.FramesPlayed()) / sampleRate < kCloudAudioSalvageSec)
+          {
+            FailCloudAudioResponse();
+            return;
+          }
+        }
+      }
+
+      if (_dVars.cloudAudioPlayback.PendingBytes() > 0 &&
+          now - _dVars.cloudAudioLastPlaybackProgressTime >= kCloudAudioStallTimeoutSec)
+      {
+        PRINT_NAMED_WARNING("BehaviorKnowledgeGraphQuestion", "Cloud audio playback made no progress");
+        FailCloudAudioResponse();
+        return;
+      }
+
+      // Pace sending so we keep at most kCloudAudioBufferAheadSec buffered in anim,
+      // which has a hard buffer limit of its own.
+      const size_t maxAheadBytes = static_cast<size_t>(kCloudAudioBufferAheadSec * bytesPerSecond);
+
+      size_t offset = 0;
+      while (offset < _dVars.cloudAudioPcm.size() &&
+             _dVars.cloudAudioPlayback.SendBudget(maxAheadBytes) >= 2)
+      {
+        const size_t remaining = _dVars.cloudAudioPcm.size() - offset;
+        const size_t budget = _dVars.cloudAudioPlayback.SendBudget(maxAheadBytes);
+        const uint16_t n = static_cast<uint16_t>(
+          std::min<size_t>(kCloudAudioMaxChunkBytes, std::min(remaining, budget)) & ~size_t{1});
+
+        if (_dVars.cloudAudioPlayback.PendingBytes() == 0)
+        {
+          _dVars.cloudAudioLastPlaybackProgressTime = now;
+        }
+        sdk.SendStreamingAudioChunk(_dVars.cloudAudioPcm.data() + offset, n);
+        offset += n;
+        _dVars.cloudAudioPlayback.Sent(n);
+      }
+
+      if (offset > 0)
+      {
+        _dVars.cloudAudioPcm.erase(_dVars.cloudAudioPcm.begin(), _dVars.cloudAudioPcm.begin() + offset);
+      }
+
+      if (_dVars.cloudAudioCompleteSent || !_dVars.cloudAudioPcm.empty())
+      {
+        return;
+      }
+
+      // Nothing left to send. Only end the stream once the cloud says the answer is
+      // finished — until then the anim player pads the gap with silence and keeps
+      // the stream alive for the next sentence.
+      const bool cloudDone = uic.IsCloudAudioComplete(_dVars.responseId) &&
+                             (uic.GetCloudAudioPendingBytes(_dVars.responseId) == 0);
+
+      if (!cloudDone && !_dVars.cloudAudioFailed)
+      {
+        return;
+      }
+
+      sdk.CompleteStreamingAudio();
+      _dVars.cloudAudioCompleteSent = true;
+      _dVars.cloudAudioCompletionDeadline = now +
+        static_cast<double>(_dVars.cloudAudioPlayback.PendingBytes()) / bytesPerSecond +
+        kCloudAudioCompletionGraceSec;
+      uic.ClearCloudAudio();
+      PRINT_INFO("Cloud audio stream for %s ended after %zu bytes",
+                 _dVars.responseId.c_str(), _dVars.cloudAudioPlayback.BytesSent());
+    }
+
+    // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    void BehaviorKnowledgeGraphQuestion::CancelCloudAudioPlayback()
+    {
+      GetBEI().GetRobotInfo().GetSDKComponent().CancelStreamingAudio();
+
+      GetBehaviorComp<UserIntentComponent>().ClearCloudAudio();
+
+      _dVars.cloudAudioPcm.clear();
+      _dVars.cloudAudioPlayback = CloudAudioPlaybackState{};
+      _dVars.cloudAudioResponseFinished = true;
+
+      if (IsControlDelegated())
+      {
+        CancelDelegates(false);
+      }
+    }
+
+    // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    void BehaviorKnowledgeGraphQuestion::FailCloudAudioResponse()
+    {
+      if (_dVars.cloudAudioResponseFinished)
+      {
+        return;
+      }
+
+      SDKComponent &sdk = GetBEI().GetRobotInfo().GetSDKComponent();
+      const double playedSec = static_cast<double>(_dVars.cloudAudioPlayback.FramesPlayed()) /
+        std::max<uint32_t>(1, _dVars.cloudAudioSampleRate);
+      sdk.CancelStreamingAudio();
+      GetBehaviorComp<UserIntentComponent>().ClearCloudAudio();
+      _dVars.cloudAudioPcm.clear();
+      _dVars.cloudAudioPlayback = CloudAudioPlaybackState{};
+      _dVars.cloudAudioCompleteSent = true;
+
+      if (IsControlDelegated())
+      {
+        CancelDelegates(false);
+      }
+
+      if (_iVars.cloudAudioFallbackToLocalTts && EState::Interrupted != _dVars.state &&
+          !_dVars.responseString.empty() && playedSec < kCloudAudioSalvageSec)
+      {
+        PRINT_INFO("Falling back to local TTS for %s", _dVars.responseId.c_str());
+        _dVars.responseSource = EResponseSource::LocalTts;
+        BeginResponseTTS();
+        return;
+      }
+
+      _dVars.cloudAudioResponseFinished = true;
+      if (EState::Interrupted != _dVars.state)
+      {
+        DelegateIfInControl(new TriggerLiftSafeAnimationAction(AnimationTrigger::KnowledgeGraphSearchingFailGetOut));
+      }
+    }
+
+    // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    void BehaviorKnowledgeGraphQuestion::FinishCloudAudioResponse()
+    {
+      if (_dVars.cloudAudioResponseFinished)
+      {
+        return;
+      }
+      _dVars.cloudAudioResponseFinished = true;
+
+      // clear any leftover buffer state
+      _dVars.cloudAudioPcm.clear();
+      _dVars.cloudAudioPlayback = CloudAudioPlaybackState{};
+
+      // don't play the success anim if we've been interrupted
+      if (EState::Interrupted != _dVars.state)
+      {
+        const auto reaction = _dVars.cloudAudioFailed
+          ? AnimationTrigger::KnowledgeGraphSearchingFailGetOut
+          : AnimationTrigger::KnowledgeGraphSuccessReaction;
+        DelegateIfInControl(new TriggerLiftSafeAnimationAction(reaction));
+      }
+    }
+
+    // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    void BehaviorKnowledgeGraphQuestion::HandleWhileActivated(const RobotToEngineEvent &event)
+    {
+      if (event.GetData().GetTag() != RobotInterface::RobotToEngineTag::audioStreamStatusEvent)
+      {
+        return;
+      }
+      if (EResponseSource::CloudAudio != _dVars.responseSource ||
+          EState::Responding != _dVars.state ||
+          _dVars.cloudAudioResponseFinished)
+      {
+        return;
+      }
+
+      const auto &statusEvent = event.GetData().Get_audioStreamStatusEvent();
+      switch (statusEvent.streamResultID)
+      {
+      case SDKAudioStreamingState::ChunkAdded:
+      {
+        const auto previousPlayed = _dVars.cloudAudioPlayback.FramesPlayed();
+        if (!_dVars.cloudAudioPlayback.UpdateProgress(statusEvent.audioReceived, statusEvent.audioPlayed))
+        {
+          PRINT_NAMED_WARNING("BehaviorKnowledgeGraphQuestion", "Invalid cloud audio playback progress");
+        }
+        else if (_dVars.cloudAudioPlayback.FramesPlayed() > previousPlayed)
+        {
+          _dVars.cloudAudioLastPlaybackProgressTime =
+            BaseStationTimer::getInstance()->GetCurrentTimeInSecondsDouble();
+        }
+        break;
+      }
+
+      case SDKAudioStreamingState::Completed:
+        if (!_dVars.cloudAudioCompleteSent)
+        {
+          PRINT_NAMED_WARNING("BehaviorKnowledgeGraphQuestion", "Cloud audio playback ended before stream completion");
+          FailCloudAudioResponse();
+          break;
+        }
+        PRINT_INFO("Cloud audio playback complete for %s", _dVars.responseId.c_str());
+        CancelDelegates(false);
+        FinishCloudAudioResponse();
+        break;
+
+      case SDKAudioStreamingState::PrepareFailed:
+      case SDKAudioStreamingState::PostFailed:
+      case SDKAudioStreamingState::AddAudioFailed:
+      case SDKAudioStreamingState::BufferOverflow:
+        PRINT_NAMED_WARNING("BehaviorKnowledgeGraphQuestion",
+                            "Cloud audio playback failed (%s)",
+                            EnumToString(statusEvent.streamResultID));
+        FailCloudAudioResponse();
+        break;
+
+      default:
+        break;
       }
     }
 

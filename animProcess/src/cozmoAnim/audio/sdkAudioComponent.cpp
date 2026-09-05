@@ -51,9 +51,6 @@ SdkAudioComponent::SdkAudioComponent(const Anim::AnimContext* context) {
   _audioController = context->GetAudioController();
   _audioPrepared = false;
   _audioPosted = false;
-  _audioPlaybackFinishedPtr = std::make_shared<AudioCallbackType>([this](){
-    OnAudioCompleted();
-  });
 }
 
 //
@@ -70,7 +67,18 @@ void SdkAudioComponent::HandleMessage(const RobotInterface::ExternalAudioComplet
   if (ANKI_VERIFY(_audioPrepared, 
                     "SdkAudioComponent.HandleMessage.ExternalAudioComplete", 
                     "Audio stream complete message received without start")) {
-    _waveData->DoneProducingData();      
+    _waveData->DoneProducingData();
+    if (!_audioPosted) {
+      if (_totalAudioFramesReceived == 0) {
+        CleanupAudioEngine();
+        SendAnimToEngine(SDKAudioStreamingState::Completed);
+      } else if (PostAudioEvent()) {
+        _audioPosted = true;
+      } else {
+        CleanupAudioEngine();
+        SendAnimToEngine(SDKAudioStreamingState::PostFailed);
+      }
+    }
   }
 }
 
@@ -98,7 +106,9 @@ void SdkAudioComponent::HandleMessage(const RobotInterface::ExternalAudioPrepare
   if (!PrepareAudioEngine(msg)) {
     LOG_DEBUG("SdkAudioComponent.HandleMessage.ExternalAudioPrepare", "Unable to prepare audio engine for streaming");
     SendAnimToEngine(SDKAudioStreamingState::PrepareFailed);
-    ClearOperationData();
+    if (!_audioPrepared) {
+      ClearOperationData();
+    }
     return;
   }
 }
@@ -134,6 +144,22 @@ void SdkAudioComponent::HandleMessage(const RobotInterface::ExternalAudioChunk& 
     _audioPosted = true;
   }
 } // HandleMessage()
+
+void SdkAudioComponent::Update()
+{
+  if (_audioPosted && _waveData->GetNumberOfFramesPlayed() != _lastAudioFramesPlayed) {
+    ReportProgress();
+  }
+}
+
+void SdkAudioComponent::ReportProgress()
+{
+  const auto played = _waveData->GetNumberOfFramesPlayed();
+  if (SendAnimToEngine(SDKAudioStreamingState::ChunkAdded,
+                      _waveData->GetNumberOfFramesReceived(), played)) {
+    _lastAudioFramesPlayed = played;
+  }
+}
 
 //
 // Set volume for audio stream playback
@@ -186,6 +212,10 @@ bool SdkAudioComponent::PrepareAudioEngine(const RobotInterface::ExternalAudioPr
 
   _audioRate = msg.audio_rate;
   _totalAudioFramesReceived = 0;
+  _lastAudioFramesPlayed = 0;
+  _audioPlaybackFinishedPtr = std::make_shared<AudioCallbackType>([this](){
+    OnAudioCompleted();
+  });
   _audioPrepared = true;
 
   return true;
@@ -196,12 +226,9 @@ bool SdkAudioComponent::PrepareAudioEngine(const RobotInterface::ExternalAudioPr
 //
 bool SdkAudioComponent::AddAudioChunk(const RobotInterface::ExternalAudioChunk& msg) {
   //check for dangerous buffer expansion
-  auto * pluginInterface = _audioController->GetPluginInterface();
-  auto * plugin = pluginInterface->GetStreamingWavePortalPlugIn();
-  const auto played = plugin->GetDataInstance(kSdkPluginId)->GetNumberOfFramesPlayed();
-  const auto received = plugin->GetDataInstance(kSdkPluginId)->GetNumberOfFramesReceived();
+  const auto played = _waveData->GetNumberOfFramesPlayed();
+  const auto received = _waveData->GetNumberOfFramesReceived();
   LOG_DEBUG("SdkAudioComponent::AddAudioChunk", "Played %u Received %u", played, received);
-  SendAnimToEngine(SDKAudioStreamingState::ChunkAdded, received, played);
 
   if (received - played > MAX_BUFFERED_AUDIO) {
     LOG_ERROR("SdkAudioComponent::AddAudioChunk", "Buffer overflow %u played %u received", played, received);
@@ -222,7 +249,8 @@ bool SdkAudioComponent::AddAudioChunk(const RobotInterface::ExternalAudioChunk& 
     return false;
   } 
 
-  _totalAudioFramesReceived = received + wave_data_size;
+  _totalAudioFramesReceived = _waveData->GetNumberOfFramesReceived();
+  ReportProgress();
 
   return true;
 }
@@ -232,6 +260,9 @@ bool SdkAudioComponent::AddAudioChunk(const RobotInterface::ExternalAudioChunk& 
 //
 bool SdkAudioComponent::PostAudioEvent()
 {
+  if (!_audioController->IsInitialized()) {
+    return false;
+  }
   auto * audioCallbackContext = new AudioEngine::AudioCallbackContext();
 
   // Set callback flags
@@ -245,7 +276,7 @@ bool SdkAudioComponent::PostAudioEvent()
                                                                      const AudioCallbackInfo& callbackInfo ) {
     // if the user logs out, this callback could fire after sdkAudioComponent is destroyed. check that here.
     auto callback = weakOnFinished.lock();
-    if( callback && (*callback) ) {
+    if( callbackInfo.callbackType == AudioEngine::AudioCallbackType::Complete && callback && (*callback) ) {
       (*callback)();
     }
   });
@@ -269,6 +300,7 @@ bool SdkAudioComponent::PostAudioEvent()
 void SdkAudioComponent::CleanupAudioEngine()
 {
   LOG_DEBUG("SdkAudioComponent.CleanupAudioEngine", "Clean up Audio Engine");
+  _audioPlaybackFinishedPtr.reset();
   StopActiveAudio();
   ClearActiveAudio();
   ClearOperationData();
@@ -280,13 +312,14 @@ void SdkAudioComponent::CleanupAudioEngine()
 void SdkAudioComponent::ClearOperationData()
 {
   LOG_DEBUG("SdkAudioComponent.ClearOperationData", "Clear Sdk Audio");
-  if (_waveData && _waveData->IsPlayingStream()) {
+  if (_waveData) {
     //no more data coming
     _waveData->DoneProducingData();
   }
 
   _audioPrepared = false;
   _audioPosted = false;
+  _audioPlaybackFinishedPtr.reset();
   _waveData = NULL;
 } 
 
@@ -296,9 +329,12 @@ void SdkAudioComponent::ClearOperationData()
 void SdkAudioComponent::StopActiveAudio()
 {
   LOG_DEBUG("SdkAudioComponent.StopActiveAudio", "Stop active Sdk audio");
+  if (!_audioPosted) {
+    return;
+  }
   using AudioEvent = AudioMetaData::GameEvent::GenericEvent;
   const auto eventID = AudioEngine::ToAudioEventId( AudioEvent::Stop__Robot_Vic__External_Sdk_Playback_01 );
-  _audioController->StopAllAudioEvents(eventID);
+  _audioController->PostAudioEvent(eventID, static_cast<AudioEngine::AudioGameObject>(kSdkGameObject));
 }
 
 //
@@ -319,6 +355,8 @@ void SdkAudioComponent::ClearActiveAudio()
 void SdkAudioComponent::OnAudioCompleted()
 {
   LOG_DEBUG("SdkAudioComponent.OnAudioCompleted", "AudioStreaming completion callback received");
+  ReportProgress();
+  ClearActiveAudio();
   ClearOperationData(); // Cleanup operation's memory
   SendAnimToEngine(SDKAudioStreamingState::Completed, 0, 0);
 }

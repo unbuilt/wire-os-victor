@@ -23,6 +23,7 @@
 
 #include <mutex>
 #include <queue>
+#include <atomic>
 
 
 class AkAudioBuffer;
@@ -60,7 +61,10 @@ public:
   bool IsPluginActive() const { return _isPluginActive; }
 
   // Return true is Data Stream has >= 1 audioDataStream
-  bool HasAudioData() const { return !_audioDataQueue.empty(); }
+  bool HasAudioData() const {
+    std::lock_guard<std::mutex> lock(_lock);
+    return !_audioDataQueue.empty();
+  }
 
   // Audio Playback (mono = 1, stereo = 2)
   uint16_t GetNumberOfChannels() const { return _numberOfChannels; }
@@ -94,16 +98,16 @@ private:
   uint16_t _numberOfChannels = 0;
   uint32_t _sampleRate       = 0;
   // Total frame count added to streaming queue
-  uint32_t _numberOfFramesReceived  = 0;
-  uint32_t _numberOfFramesPlayed    = 0;
+  std::atomic<uint32_t> _numberOfFramesReceived {0};
+  std::atomic<uint32_t> _numberOfFramesPlayed {0};
   // Run state
-  bool        _isReceivingData  = true;
+  std::atomic<bool> _isReceivingData {true};
   bool        _isPlayingData    = false;
-  bool        _isPluginActive   = false;
+  std::atomic<bool> _isPluginActive {false};
   size_t      _playheadIdx      = 0;
   BufferState _bufferState      = BufferState::Waiting;
   // Data
-  std::mutex _lock;
+  mutable std::mutex _lock;
   std::queue<PlugIns::AudioDataStream> _audioDataQueue;
   const PlugIns::AudioDataStream* _currentStream = nullptr;
 

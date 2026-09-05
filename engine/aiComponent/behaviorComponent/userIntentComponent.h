@@ -33,6 +33,8 @@
 #include <mutex>
 #include <unordered_set>
 #include <list>
+#include <vector>
+#include <cstdint>
 
 namespace Anki {
   
@@ -291,6 +293,41 @@ public:
   using SimpleVoiceResponseLambda = std::function< void( const MetaUserIntent_SimpleVoiceResponse& ) >;
   void DEVONLY_IterateSimpleVoiceResponse(UnitTestKey key, SimpleVoiceResponseLambda lambda);
 
+  ////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  // Cloud response audio
+  //
+  // Some Knowledge Graph answers are accompanied by cloud-synthesized speech, streamed from vic-cloud as a
+  // series of ResponseAudio* CloudMic messages that arrive on the same socket as the intent result. These are
+  // buffered separately from the pending intent (which occupies a single-slot member that gets overwritten
+  // each tick) so the audio stream and the result don't clobber each other. The Knowledge Graph behavior polls
+  // this API to decide whether to play cloud audio or fall back to local TTS.
+  //
+  // The backend synthesizes an answer sentence by sentence, so audio is consumed progressively: playback
+  // starts once enough has been buffered and the rest is drained as it arrives. A stream is only finished
+  // once ResponseAudioEnd has arrived *and* everything buffered has been consumed.
+  ////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+  // true once at least minBytes of PCM have arrived without error; fills in the PCM format on success.
+  // Passing 0 for minBytes just requires any audio at all.
+  bool IsCloudAudioReady(const std::string& responseId, uint32_t& sampleRateHz, uint8_t& channels,
+                         size_t minBytes = 0);
+  // true if the stream for responseId reported an error (behavior should fall back to local TTS)
+  bool HasCloudAudioError(const std::string& responseId);
+  // true if any ResponseAudioStart for responseId has been seen (audio is expected to be on its way)
+  bool HasCloudAudioStarted(const std::string& responseId);
+  // true once vic-cloud has signalled that no further audio is coming for responseId
+  bool IsCloudAudioComplete(const std::string& responseId);
+  // how much PCM is buffered and not yet consumed
+  size_t GetCloudAudioPendingBytes(const std::string& responseId);
+  // moves the buffered PCM out for responseId, leaving the stream open for more; returns empty if there is
+  // nothing buffered. Whole 16-bit frames only, so a chunk boundary never splits a sample.
+  std::vector<uint8_t> ConsumeCloudAudioPcm(const std::string& responseId);
+  // restrict buffering to a single answer, so a still-in-flight fetch for a previous answer can't
+  // overwrite it. Pass an empty string to accept any response id again.
+  void SetExpectedCloudAudioResponse(const std::string& responseId);
+  // discard any buffered cloud audio (call on interruption / behavior deactivation)
+  void ClearCloudAudio();
+
 private:
   
   // callback from the cloud
@@ -370,6 +407,25 @@ private:
   std::mutex _mutex;
   CloudMic::Message _pendingCloudIntent; // only pending for as long as it takes this thread to obtain a lock
   std::unique_ptr<BehaviorComponentCloudServer> _server;
+
+  // Buffered cloud response audio (guarded by _mutex). See the Cloud response audio section above.
+  struct CloudResponseAudioBuffer {
+    std::string responseId;
+    bool        haveStart    = false;
+    bool        complete     = false;
+    bool        hasError     = false;
+    uint32_t    sampleRateHz = 0;
+    uint8_t     channels     = 0;
+    uint32_t    nextSequence = 0;
+    size_t      totalBytes   = 0;  // whole answer, including audio already consumed
+    std::vector<uint8_t> pcm;      // buffered but not yet handed to the player
+    void Reset() { *this = CloudResponseAudioBuffer{}; }
+  };
+  CloudResponseAudioBuffer _cloudAudio;
+  std::string _cloudAudioExpectedId;  // the only response id currently accepted, if set
+
+  // routes a ResponseAudio* CloudMic message into _cloudAudio; caller must hold _mutex
+  void HandleCloudResponseAudio(const CloudMic::Message& data);
   
   bool _wasIntentUnclaimed = false;
   bool _wasIntentError = false;

@@ -15,6 +15,7 @@
 #include "coretech/messaging/shared/socketConstants.h"
 
 #include "audioEngine/audioCallback.h"
+#include "audioEngine/plugins/aecPlaybackReference.h"
 #include "audioEngine/audioTypeTranslator.h"
 #include "audioUtil/speechRecognizer.h"
 #include "cozmoAnim/alexa/alexa.h"
@@ -107,6 +108,57 @@ void MicDataSystem::SetupConsoleFuncs()
     }
   };
   _devConsoleFuncs.emplace_front("ClearMicData", std::move(clearMicDataFunc), CONSOLE_GROUP".zHiddenForSafety", "");
+  auto recording = std::make_shared<std::weak_ptr<MicDataInfo>>();
+  const auto aecCapture = [this, recording](ConsoleFunctionContextRef context)
+  {
+    const int seconds = ConsoleArg_Get_Int(context, "seconds");
+    auto previous = recording->lock();
+    if (seconds < 1 || seconds > 15 || (previous && !previous->CheckDone()) ||
+        AudioEngine::PlugIns::GetAecPlaybackReference().Diagnostic().Busy()) {
+      context->channel->WriteLog("ERROR: seconds must be 1..15 and the previous AEC capture must finish");
+      return;
+    }
+    auto job = std::make_shared<MicDataInfo>();
+    job->_writeLocationDir = Util::FileUtils::FullFilePath({_writeLocationDir, "aecExperiment"});
+    job->_writeNameBase = "";
+    job->_numMaxFiles = 100;
+    job->EnableDataCollect(MicDataType::Raw, true);
+    job->EnableDataCollect(MicDataType::Processed, true);
+    job->SetTimeToRecord(seconds * 1000);
+    {
+      std::lock_guard<std::recursive_mutex> lock(_dataRecordJobMutex);
+      _micProcessingJobs.push_back(job);
+    }
+    *recording = job;
+    context->channel->WriteLog("AEC capture scheduled: raw four-channel + processed mono, no fade, %d seconds, %s. Verify saved WAV files.",
+                               seconds, job->_writeLocationDir.c_str());
+  };
+  _devConsoleFuncs.emplace_front("AecExperimentCapture", std::move(aecCapture), CONSOLE_GROUP, "int seconds");
+  const int diagnosticMode = _micDataProcessor->GetAecExperimentMode();
+  const int diagnosticMicAge = _micDataProcessor->GetAecMicAgeMs();
+  const int diagnosticRefDelay = _micDataProcessor->GetAecRefDelayMs();
+  const auto diagnosticDirectory = Util::FileUtils::FullFilePath({_writeLocationDir, "aecDiagnostic"});
+  const auto diagnostic = [recording, diagnosticMode, diagnosticMicAge, diagnosticRefDelay,
+                           diagnosticDirectory](ConsoleFunctionContextRef context) {
+    auto& capture = AudioEngine::PlugIns::GetAecPlaybackReference().Diagnostic();
+    const auto previous = recording->lock();
+    const int seconds = ConsoleArg_Get_Int(context, "seconds");
+    if (diagnosticMode != 1 || seconds < 1 || seconds > 15 ||
+        (previous && !previous->CheckDone())) {
+      context->channel->WriteLog("ERROR: diagnostic capture requires reference mode, 1..15 seconds, no overlapping capture");
+      return;
+    }
+    Util::FileUtils::CreateDirectory(diagnosticDirectory);
+    if (!capture.Begin(diagnosticDirectory, seconds, diagnosticMode, diagnosticMicAge, diagnosticRefDelay)) {
+      context->channel->WriteLog("ERROR: diagnostic capture rejected");
+    }
+    context->channel->WriteLog("AEC_DIAGNOSTIC %s", capture.StatusJson(diagnosticMode).c_str());
+  };
+  _devConsoleFuncs.emplace_front("AecDiagnosticCapture", diagnostic, CONSOLE_GROUP, "int seconds");
+  _devConsoleFuncs.emplace_front("AecDiagnosticStatus", [diagnosticMode](ConsoleFunctionContextRef context) {
+    context->channel->WriteLog("AEC_DIAGNOSTIC %s",
+      AudioEngine::PlugIns::GetAecPlaybackReference().Diagnostic().StatusJson(diagnosticMode).c_str());
+  }, CONSOLE_GROUP, "");
 #endif
 }
 
@@ -190,6 +242,7 @@ void MicDataSystem::Init(const Anim::RobotDataLoader& dataLoader)
 
 MicDataSystem::~MicDataSystem()
 {
+  AudioEngine::PlugIns::GetAecPlaybackReference().Diagnostic().Shutdown();
   // Tear down the mic data processor explicitly first, because it uses functionality owned by MicDataSystem
   _micDataProcessor.reset();
 
@@ -211,9 +264,26 @@ void MicDataSystem::RecordProcessedAudio(uint32_t duration_ms, const std::string
   RecordAudioInternal(duration_ms, path, MicDataType::Processed, false);
 }
 
-void MicDataSystem::StartWakeWordlessStreaming(CloudMic::StreamType type, bool playGetInFromAnimProcess)
+void MicDataSystem::StartWakeWordlessStreaming(CloudMic::StreamType type, bool playGetInFromAnimProcess,
+                                              uint32_t streamId, bool freshCapture)
 {
-  
+  if (_wakeWordlessPending && _pendingStreamId == streamId) {
+    return;
+  }
+  {
+    std::lock_guard<std::recursive_mutex> lock(_dataRecordJobMutex);
+    if (streamId != 0 && _currentStreamingJob != nullptr &&
+        _currentStreamingJob->_streamId == streamId) {
+      if (!_currentStreamingJob->IsFreshCapture() || _currentlyStreaming) {
+        SendMicStreamState(streamId, true);
+      }
+      return;
+    }
+  }
+  if (_wakeWordlessPending || IsMicMuted()) {
+    SendMicStreamState(streamId, false);
+    return;
+  }
   if(HasStreamingJob())
   {
     // We "fake" having a streaming job in order to achieve the "feel" of a minimum streaming time for UX
@@ -233,37 +303,46 @@ void MicDataSystem::StartWakeWordlessStreaming(CloudMic::StreamType type, bool p
     else {
       LOG_WARNING("MicDataSystem.StartWakeWordlessStreaming.OverlappingStreamRequests",
                   "Received StartWakeWorldlessStreaming message from engine, but micDataSystem is already streaming (not faking to extend the stream)");
+      SendMicStreamState(streamId, false);
       return;
     }
   }
 
   // we want to start the stream AFTER the audio is complete so that it is not captured in the stream
-  auto callback = [this,type]( bool success )
+  _pendingStreamId = streamId;
+  _wakeWordlessPending = true;
+  const auto generation = ++_wakeWordlessGeneration;
+  auto callback = [this,type,streamId,generation,freshCapture]( bool success )
   {
+    if (generation != _wakeWordlessGeneration || !_wakeWordlessPending) {
+      return;
+    }
+    _wakeWordlessPending = false;
     // if we didn't succeed, it means that we didn't have a wake word response setup
-    if(success){
+    if(success && !IsMicMuted()){
       // it would be highly unlikely that we started another streaming job while waiting for the earcon,
       // but doesn't hurt to check
       if (!HasStreamingJob()) {
-        _micDataProcessor->CreateStreamJob(type, kTriggerLessOverlapSize_ms);
+        _micDataProcessor->CreateStreamJob(type, kTriggerLessOverlapSize_ms, streamId, freshCapture);
         LOG_INFO("MicDataSystem.StartWakeWordlessStreaming.StartStreaming",
                  "Starting Wake Wordless streaming");
       }
       else {
         LOG_WARNING("MicDataSystem.StartWakeWordlessStreaming.OverlappingStreamRequests",
                     "Started streaming job while waiting for StartTriggerResponseWithoutGetIn callback");
-        SetWillStream(false);
+        SendMicStreamState(streamId, false);
       }
     }
     else {
       LOG_WARNING("MicDataSystem.StartWakeWordlessStreaming.CantStreamToCloud",
                   "Wakewordless streaming request received, but incapable of opening the cloud stream, so ignoring request");
       SetWillStream(false);
+      SendMicStreamState(streamId, false);
     }
   };
 
   ShowAudioStreamStateManager* showStreamState = _context->GetShowAudioStreamStateManager();
-  if(showStreamState->HasValidTriggerResponse()){
+  if(!freshCapture && showStreamState->HasValidTriggerResponse()){
     SetWillStream(true);
   }
 
@@ -273,6 +352,35 @@ void MicDataSystem::StartWakeWordlessStreaming(CloudMic::StreamType type, bool p
   else {
     showStreamState->SetPendingTriggerResponseWithoutGetIn(callback);
   }
+}
+
+void MicDataSystem::SendMicStreamState(uint32_t streamId, bool open)
+{
+  RobotInterface::MicStreamState state;
+  state.streamId = streamId;
+  state.open = open;
+  state.muted = IsMicMuted();
+  SendMessageToEngine(std::make_unique<RobotInterface::RobotToEngine>(std::move(state)));
+}
+
+void MicDataSystem::StopWakeWordlessStreaming(uint32_t streamId)
+{
+  if (_wakeWordlessPending && _pendingStreamId == streamId) {
+    ++_wakeWordlessGeneration;
+    _wakeWordlessPending = false;
+    SetWillStream(false);
+  }
+  {
+    std::lock_guard<std::recursive_mutex> lock(_dataRecordJobMutex);
+    if (_currentStreamingJob != nullptr && _currentStreamingJob->_streamId == streamId) {
+      SendUdpMessage(CloudMic::Message::CreatecancelStream(CloudMic::StreamIdentifier{streamId}));
+      ClearCurrentStreamingJob();
+      return;
+    }
+  }
+  // An idempotent stop must also acknowledge a start rejected before capture.
+  SendUdpMessage(CloudMic::Message::CreatecancelStream(CloudMic::StreamIdentifier{streamId}));
+  SendMicStreamState(streamId, false);
 }
 
 void MicDataSystem::FakeTriggerWordDetection()
@@ -383,7 +491,11 @@ void MicDataSystem::Update(BaseStationTime_t currTime_nanosec)
 
       case CloudMic::MessageTag::stopSignal:
         LOG_INFO("MicDataSystem.Update.RecvCloudProcess.StopSignal", "");
-        receivedStopMessage = true;
+        {
+          std::lock_guard<std::recursive_mutex> lock(_dataRecordJobMutex);
+          receivedStopMessage = _currentStreamingJob != nullptr &&
+            msg.Get_stopSignal().streamId == _currentStreamingJob->_streamId;
+        }
         break;
 
       #if ANKI_DEV_CHEATS
@@ -421,7 +533,6 @@ void MicDataSystem::Update(BaseStationTime_t currTime_nanosec)
 
       default:
         LOG_INFO("MicDataSystem.Update.RecvCloudProcess.UnexpectedSignal", "0x%x 0x%x", receiveArray[0], receiveArray[1]);
-        receivedStopMessage = true;
         break;
     }
   }
@@ -478,7 +589,9 @@ void MicDataSystem::Update(BaseStationTime_t currTime_nanosec)
     // ... this block is where we kick off a new stream to the cloud ...
 
     // check if the pointer to the currently streaming job is valid
-    if (!_currentlyStreaming && HasStreamingJob()
+    if (!_currentlyStreaming && HasStreamingJob() &&
+        (!_currentStreamingJob || !_currentStreamingJob->IsFreshCapture() ||
+         _currentStreamingJob->HasCapturedAudio())
       #if ANKI_DEV_CHEATS
         && !_forceRecordClip
       #endif
@@ -492,6 +605,9 @@ void MicDataSystem::Update(BaseStationTime_t currTime_nanosec)
         _currentlyStreaming = true;
         _streamingComplete = ShouldSimulateStreaming();
         _streamingAudioIndex = 0;
+        if (_currentStreamingJob && _currentStreamingJob->IsFreshCapture()) {
+          NotifyCaptureStarted();
+        }
 
         // even though this isn't necessarily the exact frame the backpack lights begin (since that's done in a different
         // thread), it doesn't make a noticeable difference since this is an arbitrary number and doesn't need to be precise
@@ -499,9 +615,10 @@ void MicDataSystem::Update(BaseStationTime_t currTime_nanosec)
 
         // Send out the message announcing the trigger word has been detected
         auto hw = CloudMic::Hotword{CloudMic::StreamType::Normal, _locale.ToString(),
-                                    _timeZone, !_enableDataCollection};
+                                    _timeZone, !_enableDataCollection, 0};
         if (_currentStreamingJob != nullptr) {
           hw.mode = _currentStreamingJob->_type;
+          hw.streamId = _currentStreamingJob->_streamId;
         }
         SendUdpMessage(CloudMic::Message::Createhotword(std::move(hw)));
         LOG_INFO("MicDataSystem.Update.StreamingStart", "");
@@ -532,7 +649,8 @@ void MicDataSystem::Update(BaseStationTime_t currTime_nanosec)
 
           if (didTimeout)
           {
-            SendUdpMessage(CloudMic::Message::CreateaudioDone({}));
+            SendUdpMessage(CloudMic::Message::CreateaudioDone(
+              CloudMic::StreamIdentifier{_currentStreamingJob ? _currentStreamingJob->_streamId : 0}));
           }
           LOG_INFO("MicDataSystem.Update.StreamingEnd", "%zu ms", _streamingAudioIndex * kTimePerChunk_ms);
           #if ANKI_DEV_CHEATS
@@ -554,7 +672,8 @@ void MicDataSystem::Update(BaseStationTime_t currTime_nanosec)
             {
               for(const auto& audioChunk : newAudio)
               {
-                SendUdpMessage(CloudMic::Message::Createaudio(CloudMic::AudioData{audioChunk}));
+                SendUdpMessage(CloudMic::Message::Createaudio(
+                  CloudMic::AudioData{audioChunk, _currentStreamingJob->_streamId}));
               }
             }
           }
@@ -613,6 +732,10 @@ void MicDataSystem::Update(BaseStationTime_t currTime_nanosec)
     else if (msg->tag == RobotInterface::RobotToEngine::Tag_beatDetectorState)
     {
       RobotInterface::SendAnimToEngine(msg->beatDetectorState);
+    }
+    else if (msg->tag == RobotInterface::RobotToEngine::Tag_micStreamState)
+    {
+      RobotInterface::SendAnimToEngine(msg->micStreamState);
     }
     else
     {
@@ -689,8 +812,18 @@ void MicDataSystem::ClearCurrentStreamingJob()
     _currentlyStreaming = false;
     if (_currentStreamingJob != nullptr)
     {
-      _currentStreamingJob->SetTimeToRecord(0);
+      const uint32_t streamId = _currentStreamingJob->_streamId;
+      if (_currentStreamingJob->IsFreshCapture()) {
+        DASMSG(followup_capture_stop, "voice.followup.capture_stop", "Follow-up collector quiescing");
+        DASMSG_SET(i1, streamId, "Stream identity");
+        DASMSG_SET(i2, _streamingAudioIndex * kTimePerChunk_ms, "Nominal audio sent in milliseconds");
+        DASMSG_SEND();
+      }
+      // Synchronizes with collectors even when a worker holds a snapshot of
+      // the old job list. No collector can append after this returns.
+      _currentStreamingJob->StopCollecting();
       _currentStreamingJob = nullptr;
+      SendMicStreamState(streamId, false);
 
       for(auto func : _streamUpdatedCallbacks)
       {
@@ -734,17 +867,35 @@ bool MicDataSystem::HasStreamingJob() const
 void MicDataSystem::AddMicDataJob(std::shared_ptr<MicDataInfo> newJob, bool isStreamingJob)
 {
   std::lock_guard<std::recursive_mutex> lock(_dataRecordJobMutex);
+  if (isStreamingJob && _currentStreamingJob != nullptr) {
+    newJob->StopCollecting();
+    SendMicStreamState(newJob->_streamId, false);
+    return;
+  }
   _micProcessingJobs.push_back(std::shared_ptr<MicDataInfo>(newJob));
   if (isStreamingJob)
   {
     _currentStreamingJob = _micProcessingJobs.back();
+    _streamingAudioIndex = 0;
+    if (!_currentStreamingJob->IsFreshCapture()) {
+      NotifyCaptureStarted();
+    }
+  }
+}
 
-    for(auto func : _streamUpdatedCallbacks)
+void MicDataSystem::NotifyCaptureStarted()
+{
+  if (_currentStreamingJob->IsFreshCapture()) {
+    DASMSG(followup_capture_ready, "voice.followup.capture_ready", "Fresh audio available; listening lights and acknowledgement");
+    DASMSG_SET(i1, _currentStreamingJob->_streamId, "Stream identity");
+    DASMSG_SEND();
+  }
+  SendMicStreamState(_currentStreamingJob->_streamId, true);
+  for(auto func : _streamUpdatedCallbacks)
+  {
+    if(func != nullptr)
     {
-      if(func != nullptr)
-      {
-        func(true);
-      }
+      func(true);
     }
   }
 }
@@ -866,6 +1017,16 @@ void MicDataSystem::ToggleMicMute()
   // and recognizers methods, therefore, saving CPU. However, mic threads are still runing.
   _micMuted = !_micMuted;
   _micDataProcessor->MuteMics(_micMuted);
+  SendMicStreamState(0, false);
+  if (_micMuted) {
+    if (_wakeWordlessPending) {
+      StopWakeWordlessStreaming(_pendingStreamId);
+    }
+    std::lock_guard<std::recursive_mutex> lock(_dataRecordJobMutex);
+    if (_currentStreamingJob != nullptr) {
+      StopWakeWordlessStreaming(_currentStreamingJob->_streamId);
+    }
+  }
   
   // play audio event for changing mic mute state
   auto* audioController = _context->GetAudioController();

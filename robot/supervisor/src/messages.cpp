@@ -719,17 +719,28 @@ namespace Anki {
         return RobotInterface::SendMessage(m) ? RESULT_OK : RESULT_FAIL;
       }
 
-      Result SendMicDataFunction(const s16* latestMicData, uint32_t numSamples) 
+      Result SendMicDataFunction(const s16* latestMicData, uint32_t numSamples,
+                                 uint32_t sourceFrame, uint64_t receivedNs, bool timingValid)
       {
         static int chunkID = 0;
         static const int numChannels = 4;
         static const int samplesPerChunk = 80;
         static const int samplesPerDeinterlacedChunk = 160;
         static int16_t sampleBuffer[numChannels * samplesPerDeinterlacedChunk];
+        static uint32_t firstFrame = 0;
+        static bool firstTimingValid = false;
         RobotInterface::MicData micData{};
         micData.timestamp = HAL::GetTimeStamp();
         micData.robotStatusFlags = robotState_.status;
         micData.robotRotationAngle = robotState_.pose.angle;
+        if (chunkID == 0) {
+          firstFrame = sourceFrame;
+          firstTimingValid = timingValid;
+        }
+        micData.sourceFirstFrame = firstFrame;
+        micData.sourceLastFrame = sourceFrame;
+        micData.sourceReceivedNs = receivedNs;
+        micData.sourceTimingValid = firstTimingValid && timingValid;
 
         /*
         Deinterlace the audio before sending it to Engine/Anim. Coming into this method, we

@@ -63,6 +63,7 @@ public:
   virtual void GetUpdateDependencies(BCCompIDSet& dependencies) const override
   {
     dependencies.insert(BCComponentID::UserIntentComponent);
+    dependencies.insert(BCComponentID::ConversationSessionComponent);
   }
 
   virtual void AdditionalUpdateAccessibleComponents(BCCompIDSet& components) const override

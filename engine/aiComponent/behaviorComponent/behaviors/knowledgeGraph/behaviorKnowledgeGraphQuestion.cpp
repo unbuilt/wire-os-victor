@@ -20,6 +20,7 @@
 #include "engine/aiComponent/behaviorComponent/behaviorExternalInterface/behaviorExternalInterface.h"
 #include "engine/aiComponent/behaviorComponent/behaviorExternalInterface/beiRobotInfo.h"
 #include "engine/aiComponent/behaviorComponent/userIntentComponent.h"
+#include "engine/aiComponent/behaviorComponent/conversationSessionComponent.h"
 #include "engine/aiComponent/behaviorComponent/userIntentData.h"
 #include "engine/aiComponent/behaviorComponent/userIntents.h"
 #include "engine/audio/engineRobotAudioClient.h"
@@ -37,6 +38,7 @@
 #include "util/console/consoleInterface.h"
 #include "util/global/globalDefinitions.h"
 #include "util/logging/logging.h"
+#include "util/logging/DAS.h"
 #include "clad/types/animationTrigger.h"
 
 #include <algorithm>
@@ -63,6 +65,8 @@ namespace Anki
       const char *kKey_CloudAudioReadyTimeout = "cloudAudioReadyTimeout";
       const char *kKey_CloudAudioFallback = "cloudAudioFallbackToLocalTts";
       const char *kKey_CloudAudioVolume = "cloudAudioVolume";
+      const char *kKey_MultiTurnVoice = "multiTurnVoice";
+      uint32_t sPlaybackId = 0;
 
       const double kDefaultDuration = 10.0;
       const char *kDefaultReadyStringID = "BehaviorKnowledgeGraphQuestion.Ready";
@@ -115,6 +119,7 @@ namespace Anki
       }
 
       JsonTools::GetValueOptional(config, kKey_CloudAudioEnabled, _iVars.cloudAudioEnabled);
+      _iVars.multiTurnVoice = config[kKey_MultiTurnVoice];
       JsonTools::GetValueOptional(config, kKey_CloudAudioRequestTimeout, _iVars.cloudAudioRequestTimeout);
       JsonTools::GetValueOptional(config, kKey_CloudAudioReadyTimeout, _iVars.cloudAudioReadyTimeout);
       JsonTools::GetValueOptional(config, kKey_CloudAudioFallback, _iVars.cloudAudioFallbackToLocalTts);
@@ -146,11 +151,13 @@ namespace Anki
       expectedKeys.insert(kKey_CloudAudioReadyTimeout);
       expectedKeys.insert(kKey_CloudAudioFallback);
       expectedKeys.insert(kKey_CloudAudioVolume);
+      expectedKeys.insert(kKey_MultiTurnVoice);
     }
 
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
     void BehaviorKnowledgeGraphQuestion::InitBehavior()
     {
+      GetBehaviorComp<ConversationSessionComponent>().Configure(_iVars.multiTurnVoice);
       const BehaviorContainer &container = GetBEI().GetBehaviorContainer();
       container.FindBehaviorByIDAndDowncast<BehaviorTextToSpeechLoop>(BEHAVIOR_ID(KnowledgeGraphTTS),
                                                                       BEHAVIOR_CLASS(TextToSpeechLoop),
@@ -184,6 +191,7 @@ namespace Anki
     void BehaviorKnowledgeGraphQuestion::OnBehaviorActivated()
     {
       _dVars = DynamicVariables();
+      _dVars.conversationToken = GetBehaviorComp<ConversationSessionComponent>().Policy().Token();
 
       // Get ready text for current locale
       const auto &bei = GetBEI();
@@ -223,6 +231,7 @@ namespace Anki
     {
       // make sure we cancel the ready utterance if we bail during it playing
       _readyTTSWrapper.CancelUtterance();
+      _iVars.ttsBehavior->ClearTextToSay();
 
       // if we were streaming cloud audio and didn't finish cleanly, stop it and drop the buffer
       if (EResponseSource::CloudAudio == _dVars.responseSource && !_dVars.cloudAudioResponseFinished)
@@ -303,7 +312,9 @@ namespace Anki
             : _iVars.streamingDuration;
           const bool timeIsUp = (!FLT_NEAR(_dVars.streamingBeginTime, 0.f)) &&
                                 (currentTime >= (_dVars.streamingBeginTime + requestTimeout));
-          if (IsResponsePending() || timeIsUp)
+          const bool openingFailed = FLT_NEAR(_dVars.streamingBeginTime, 0.f) &&
+                                     currentTime >= _dVars.streamingRequestTime + 5.0;
+          if (IsResponsePending() || timeIsUp || openingFailed || uic.WasUserIntentError())
           {
             CancelDelegates(false);
             OnStreamingComplete(false);
@@ -337,6 +348,7 @@ namespace Anki
       PRINT_DEBUG("Knowledge Graph streaming begun ...");
 
       _dVars.state = EState::Listening;
+      _dVars.streamingRequestTime = BaseStationTimer::getInstance()->GetCurrentTimeInSecondsDouble();
 
       GetBehaviorComp<UserIntentComponent>().StartWakeWordlessStreaming(CloudMic::StreamType::KnowledgeGraph);
     }
@@ -499,13 +511,19 @@ namespace Anki
       // delegate to our tts behavior
       if (_iVars.ttsBehavior->WantsToBeActivated())
       {
-        auto callback = [this]()
+        const auto token = _dVars.conversationToken;
+        auto callback = [this, token]()
         {
           // don't play the success anim if we've been interrupted
-          if (EState::Interrupted != _dVars.state)
+          if (token == _dVars.conversationToken && EState::Interrupted != _dVars.state)
           {
             // play our "woot woot" animation
-            DelegateIfInControl(new TriggerLiftSafeAnimationAction(AnimationTrigger::KnowledgeGraphSuccessReaction));
+            if (_iVars.ttsBehavior->GetPlaybackOutcome() ==
+                BehaviorTextToSpeechLoop::PlaybackOutcome::Succeeded) {
+              PlaySuccessfulResponseGetOut();
+            } else {
+              DelegateIfInControl(new TriggerLiftSafeAnimationAction(AnimationTrigger::KnowledgeGraphSuccessReaction));
+            }
           }
         };
 
@@ -519,13 +537,20 @@ namespace Anki
     void BehaviorKnowledgeGraphQuestion::TransitionToSearchingLoop()
     {
       // If this response is using cloud audio, loop the searching anim until the PCM
-      // stream is ready, then transition out. On error/timeout, fall back to local TTS.
+      // stream is ready. Interrupted answers stop quietly; ordinary fetch/provider
+      // failures may still fall back to local TTS.
       if (EResponseSource::CloudAudio == _dVars.responseSource)
       {
         UserIntentComponent &uic = GetBehaviorComp<UserIntentComponent>();
         uint32_t sampleRate = 0;
         uint8_t channels = 0;
         const double now = BaseStationTimer::getInstance()->GetCurrentTimeInSecondsDouble();
+
+        if (uic.HasCloudAudioInterruption(_dVars.responseId))
+        {
+          FailCloudAudioResponse(true);
+          return;
+        }
 
         if (uic.IsCloudAudioReady(_dVars.responseId, sampleRate, channels, kCloudAudioPrebufferBytes))
         {
@@ -539,11 +564,16 @@ namespace Anki
 
         const bool hadError = uic.HasCloudAudioError(_dVars.responseId);
         const bool timedOut = (now >= _dVars.cloudAudioReadyDeadline);
+        if (timedOut && !hadError && uic.HasCloudAudioStarted(_dVars.responseId))
+        {
+          FailCloudAudioResponse(true);
+          return;
+        }
         if (hadError || timedOut)
         {
           PRINT_INFO("Cloud audio unavailable for %s (%s); falling back",
                      _dVars.responseId.c_str(), hadError ? "error" : "timeout");
-          uic.ClearCloudAudio();
+          uic.ClearCloudAudio(_dVars.responseId);
 
           if (_iVars.cloudAudioFallbackToLocalTts)
           {
@@ -639,6 +669,8 @@ namespace Anki
     {
       DEV_ASSERT(EState::Responding == _dVars.state, "Should only allow interruptions during response state");
       PRINT_INFO("Interruption event received, cancelling TTS");
+      GetBehaviorComp<ConversationSessionComponent>().Policy().ResponseFinished(
+        _dVars.conversationToken, ConversationSessionState::Outcome::Cancelled);
 
       _dVars.state = EState::Interrupted;
 
@@ -662,6 +694,11 @@ namespace Anki
     void BehaviorKnowledgeGraphQuestion::BeginResponseCloudAudio()
     {
       UserIntentComponent &uic = GetBehaviorComp<UserIntentComponent>();
+      if (uic.HasCloudAudioInterruption(_dVars.responseId))
+      {
+        FailCloudAudioResponse(true);
+        return;
+      }
       _dVars.cloudAudioPcm = uic.ConsumeCloudAudioPcm(_dVars.responseId);
 
       if (_dVars.cloudAudioPcm.empty())
@@ -683,10 +720,12 @@ namespace Anki
       _dVars.cloudAudioPlayback = CloudAudioPlaybackState{};
       _dVars.cloudAudioCompleteSent = false;
       _dVars.cloudAudioResponseFinished = false;
+      if (++sPlaybackId == 0) { ++sPlaybackId; }
+      _dVars.playbackId = sPlaybackId;
 
       // prepare the streaming player with the PCM format
       GetBEI().GetRobotInfo().GetSDKComponent().PrepareStreamingAudio(
-          static_cast<uint16_t>(sampleRate), static_cast<uint16_t>(_iVars.cloudAudioVolume));
+          static_cast<uint16_t>(sampleRate), static_cast<uint16_t>(_iVars.cloudAudioVolume), _dVars.playbackId);
 
       const double now = BaseStationTimer::getInstance()->GetCurrentTimeInSecondsDouble();
       _dVars.cloudAudioStreamStartTime = now;
@@ -772,11 +811,8 @@ namespace Anki
                               "Cloud audio for %s %s after %.2fs played",
                               _dVars.responseId.c_str(), failed ? "failed" : "stalled",
                               static_cast<double>(_dVars.cloudAudioPlayback.FramesPlayed()) / sampleRate);
-          if (static_cast<double>(_dVars.cloudAudioPlayback.FramesPlayed()) / sampleRate < kCloudAudioSalvageSec)
-          {
-            FailCloudAudioResponse();
-            return;
-          }
+          FailCloudAudioResponse(stalled || uic.HasCloudAudioInterruption(_dVars.responseId));
+          return;
         }
       }
 
@@ -805,7 +841,7 @@ namespace Anki
         {
           _dVars.cloudAudioLastPlaybackProgressTime = now;
         }
-        sdk.SendStreamingAudioChunk(_dVars.cloudAudioPcm.data() + offset, n);
+        sdk.SendStreamingAudioChunk(_dVars.cloudAudioPcm.data() + offset, n, _dVars.playbackId);
         offset += n;
         _dVars.cloudAudioPlayback.Sent(n);
       }
@@ -826,17 +862,17 @@ namespace Anki
       const bool cloudDone = uic.IsCloudAudioComplete(_dVars.responseId) &&
                              (uic.GetCloudAudioPendingBytes(_dVars.responseId) == 0);
 
-      if (!cloudDone && !_dVars.cloudAudioFailed)
+      if (!cloudDone)
       {
         return;
       }
 
-      sdk.CompleteStreamingAudio();
+      sdk.CompleteStreamingAudio(_dVars.playbackId);
       _dVars.cloudAudioCompleteSent = true;
       _dVars.cloudAudioCompletionDeadline = now +
         static_cast<double>(_dVars.cloudAudioPlayback.PendingBytes()) / bytesPerSecond +
         kCloudAudioCompletionGraceSec;
-      uic.ClearCloudAudio();
+      uic.ClearCloudAudio(_dVars.responseId);
       PRINT_INFO("Cloud audio stream for %s ended after %zu bytes",
                  _dVars.responseId.c_str(), _dVars.cloudAudioPlayback.BytesSent());
     }
@@ -844,9 +880,11 @@ namespace Anki
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
     void BehaviorKnowledgeGraphQuestion::CancelCloudAudioPlayback()
     {
-      GetBEI().GetRobotInfo().GetSDKComponent().CancelStreamingAudio();
+      if (_dVars.playbackId != 0) {
+        GetBEI().GetRobotInfo().GetSDKComponent().CancelStreamingAudio(_dVars.playbackId);
+      }
 
-      GetBehaviorComp<UserIntentComponent>().ClearCloudAudio();
+      GetBehaviorComp<UserIntentComponent>().ClearCloudAudio(_dVars.responseId);
 
       _dVars.cloudAudioPcm.clear();
       _dVars.cloudAudioPlayback = CloudAudioPlaybackState{};
@@ -859,18 +897,32 @@ namespace Anki
     }
 
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-    void BehaviorKnowledgeGraphQuestion::FailCloudAudioResponse()
+    void BehaviorKnowledgeGraphQuestion::FailCloudAudioResponse(bool quiet)
     {
       if (_dVars.cloudAudioResponseFinished)
       {
         return;
       }
 
+      if (quiet)
+      {
+        PRINT_NAMED_WARNING("BehaviorKnowledgeGraphQuestion",
+                            "Interrupted cloud answer %s; stopping without local TTS or follow-up",
+                            _dVars.responseId.c_str());
+        _dVars.cloudAudioFailed = true;
+        _dVars.state = EState::Interrupted;
+        GetBehaviorComp<ConversationSessionComponent>().Policy().ResponseFinished(
+          _dVars.conversationToken, ConversationSessionState::Outcome::Failed);
+        CancelCloudAudioPlayback();
+        CancelSelf();
+        return;
+      }
+
       SDKComponent &sdk = GetBEI().GetRobotInfo().GetSDKComponent();
       const double playedSec = static_cast<double>(_dVars.cloudAudioPlayback.FramesPlayed()) /
         std::max<uint32_t>(1, _dVars.cloudAudioSampleRate);
-      sdk.CancelStreamingAudio();
-      GetBehaviorComp<UserIntentComponent>().ClearCloudAudio();
+      sdk.CancelStreamingAudio(_dVars.playbackId);
+      GetBehaviorComp<UserIntentComponent>().ClearCloudAudio(_dVars.responseId);
       _dVars.cloudAudioPcm.clear();
       _dVars.cloudAudioPlayback = CloudAudioPlaybackState{};
       _dVars.cloudAudioCompleteSent = true;
@@ -915,8 +967,36 @@ namespace Anki
         const auto reaction = _dVars.cloudAudioFailed
           ? AnimationTrigger::KnowledgeGraphSearchingFailGetOut
           : AnimationTrigger::KnowledgeGraphSuccessReaction;
-        DelegateIfInControl(new TriggerLiftSafeAnimationAction(reaction));
+        if (!_dVars.cloudAudioFailed) {
+          PlaySuccessfulResponseGetOut();
+        } else {
+          DelegateIfInControl(new TriggerLiftSafeAnimationAction(reaction));
+        }
       }
+    }
+
+    void BehaviorKnowledgeGraphQuestion::PlaySuccessfulResponseGetOut()
+    {
+      const auto token = _dVars.conversationToken;
+      auto& conversation = GetBehaviorComp<ConversationSessionComponent>();
+      // The celebratory animation lasts ~3.3s on hardware. A continuing turn
+      // has already finished answer playback (and local TTS get-out); do not
+      // insert another audible/moving response before its settle and earcon.
+      if (EState::Interrupted != _dVars.state && conversation.IsSafe() &&
+          conversation.Policy().CanContinueResponse(token,
+            BaseStationTimer::getInstance()->GetCurrentTimeInSecondsDouble())) {
+        DASMSG(followup_response_finished, "voice.followup.response_finished", "Answer playback and required get-out finished; omitting celebration");
+        DASMSG_SET(i1, _dVars.playbackId, "Renderer playback identity, if allocated");
+        DASMSG_SEND();
+        conversation.Policy().ResponseFinished(token, ConversationSessionState::Outcome::Succeeded);
+        return;
+      }
+      DelegateIfInControl(new TriggerLiftSafeAnimationAction(AnimationTrigger::KnowledgeGraphSuccessReaction),
+        [this, token](ActionResult result) {
+          GetBehaviorComp<ConversationSessionComponent>().Policy().ResponseFinished(
+            token, result == ActionResult::SUCCESS && EState::Interrupted != _dVars.state
+              ? ConversationSessionState::Outcome::Succeeded : ConversationSessionState::Outcome::Failed);
+        });
     }
 
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -934,6 +1014,7 @@ namespace Anki
       }
 
       const auto &statusEvent = event.GetData().Get_audioStreamStatusEvent();
+      if (statusEvent.playbackId != _dVars.playbackId) { return; }
       switch (statusEvent.streamResultID)
       {
       case SDKAudioStreamingState::ChunkAdded:

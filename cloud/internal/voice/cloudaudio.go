@@ -2,10 +2,12 @@ package voice
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"strings"
@@ -31,8 +33,83 @@ const (
 	// cloudAudioTimeout bounds the whole answer, not just the first byte. The
 	// backend synthesizes sentence by sentence and keeps the body open while
 	// later sentences are still being produced.
-	cloudAudioTimeout = 60 * time.Second
+	cloudAudioTimeout    = 60 * time.Second
+	cloudAudioFramedType = "application/vnd.lycopod.answer-audio.v1"
 )
+
+type cloudAudioFailure struct {
+	kind   cloud.ResponseAudioErrorType
+	detail string
+}
+
+func (e *cloudAudioFailure) Error() string { return e.detail }
+
+// A successful HTTP EOF is insufficient: the negotiated protocol must contain
+// END. Abort and upstream transport failure stay distinct even after status 200.
+type framedCloudAudio struct {
+	io.ReadCloser
+	remaining uint32
+	done      bool
+}
+
+func (r *framedCloudAudio) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r.done {
+		return 0, io.EOF
+	}
+	failure := func(kind cloud.ResponseAudioErrorType, detail string) (int, error) {
+		return 0, &cloudAudioFailure{kind: kind, detail: detail}
+	}
+	if r.remaining == 0 {
+		var header [5]byte
+		if _, err := io.ReadFull(r.ReadCloser, header[:]); err != nil {
+			return failure(cloud.ResponseAudioErrorType_Transport, "answer stream ended without terminal frame: "+err.Error())
+		}
+		r.remaining = binary.BigEndian.Uint32(header[1:])
+		if header[0] == 0 {
+			if r.remaining == 0 || r.remaining > cloudAudioChunkBytes {
+				return failure(cloud.ResponseAudioErrorType_InvalidFormat, "invalid answer PCM frame length")
+			}
+		} else {
+			if r.remaining != 0 {
+				return failure(cloud.ResponseAudioErrorType_InvalidFormat, "answer terminal frame has payload")
+			}
+			switch header[0] {
+			case 1:
+				var tail [1]byte
+				n, err := io.ReadFull(r.ReadCloser, tail[:])
+				if n != 0 {
+					return failure(cloud.ResponseAudioErrorType_InvalidFormat, "unexpected data after answer END")
+				}
+				if err != io.EOF {
+					return failure(cloud.ResponseAudioErrorType_Transport, "answer stream did not finish cleanly after END")
+				}
+				r.done = true
+				return 0, io.EOF
+			case 2:
+				return failure(cloud.ResponseAudioErrorType_Cancelled, "answer cancelled by upstream")
+			case 3:
+				return failure(cloud.ResponseAudioErrorType_Transport, "upstream answer connection interrupted")
+			case 4:
+				return failure(cloud.ResponseAudioErrorType_Provider, "answer producer failed")
+			default:
+				return failure(cloud.ResponseAudioErrorType_InvalidFormat, "unknown answer frame type")
+			}
+		}
+	}
+	if uint32(len(p)) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n, err := io.ReadFull(r.ReadCloser, p)
+	r.remaining -= uint32(n)
+	if err != nil {
+		return n, &cloudAudioFailure{kind: cloud.ResponseAudioErrorType_Transport,
+			detail: "truncated answer PCM frame: " + err.Error()}
+	}
+	return n, nil
+}
 
 // kgResponseParams is the subset of the Knowledge Graph intent parameters that
 // the cloud-audio path cares about.
@@ -41,6 +118,56 @@ type kgResponseParams struct {
 	ResponseID          string `json:"response_id"`
 	AudioID             string `json:"audio_id"`
 	CloudAudioAvailable bool   `json:"cloud_audio_available"`
+}
+
+type cloudAudioOwner struct {
+	streamID   uint32
+	generation uint64
+}
+
+func (p *Process) beginAudioOwner(streamID uint32) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	p.audioOwner.generation++
+	p.audioOwner.streamID = streamID
+}
+
+func (p *Process) cancelAudioOwner(streamID uint32) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	if p.audioOwner.streamID == streamID {
+		p.audioOwner.generation++
+	}
+}
+
+func (p *Process) getAudioOwner(owners []cloudAudioOwner) cloudAudioOwner {
+	if len(owners) != 0 {
+		return owners[0]
+	}
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	return p.audioOwner
+}
+
+// Check generation and write under the same lock: even legacy stream ID zero
+// cannot allow a previous HTTP worker to write into a replacement request.
+func (p *Process) writeCloudAudio(response *cloud.Message, owner cloudAudioOwner) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	if owner != p.audioOwner {
+		return
+	}
+	switch response.Tag() {
+	case cloud.MessageTag_ResponseAudioStart:
+		response.GetResponseAudioStart().StreamId = owner.streamID
+	case cloud.MessageTag_ResponseAudioChunk:
+		response.GetResponseAudioChunk().StreamId = owner.streamID
+	case cloud.MessageTag_ResponseAudioEnd:
+		response.GetResponseAudioEnd().StreamId = owner.streamID
+	case cloud.MessageTag_ResponseAudioError:
+		response.GetResponseAudioError().StreamId = owner.streamID
+	}
+	p.writeResponseLocked(response)
 }
 
 // maybeSendCloudAudio inspects a just-delivered intent result and, if it is a
@@ -66,58 +193,67 @@ func (p *Process) maybeSendCloudAudio(result *cloud.IntentResult) {
 	if params.AudioID == "" && params.Answer == "" {
 		return
 	}
-	go p.sendCloudAudio(endpoint, params.ResponseID, params.AudioID, params.Answer)
+	owner := p.getAudioOwner(nil)
+	go p.sendCloudAudio(endpoint, params.ResponseID, params.AudioID, params.Answer, owner)
 }
 
 // sendCloudAudio fetches the answer audio and streams it to the engine as it
 // arrives, so playback can start on the first sentence while the backend is
-// still synthesizing the rest. On any failure it emits a ResponseAudioError so
-// the robot falls back to local TTS promptly.
-func (p *Process) sendCloudAudio(endpoint, responseID, audioID, text string) {
+// still synthesizing the rest. Interrupted answers emit typed errors so the
+// engine stops quietly, rather than repeating partial text through local TTS.
+func (p *Process) sendCloudAudio(endpoint, responseID, audioID, text string, owners ...cloudAudioOwner) {
+	owner := p.getAudioOwner(owners)
 	log.Printf("Cloud audio: starting fetch for %s (audio_id_present=%t)\n", responseID, audioID != "")
 	body, err := openCloudAudio(endpoint, audioID, text)
 	if err != nil {
 		log.Println("Cloud audio: fetch failed:", err)
-		p.sendCloudAudioError(responseID, err)
+		p.sendCloudAudioError(responseID, err, owner)
 		return
 	}
 	defer body.Close()
 
 	// The answer length is not known up front: the backend keeps the body open
 	// while later sentences are synthesized.
-	p.writeResponse(cloud.NewMessageWithResponseAudioStart(&cloud.ResponseAudioStart{
+	p.writeCloudAudio(cloud.NewMessageWithResponseAudioStart(&cloud.ResponseAudioStart{
 		ResponseId:       responseID,
 		Encoding:         cloud.ResponseAudioEncoding_Pcm16Le,
 		SampleRateHz:     cloudAudioSampleRate,
 		Channels:         cloudAudioChannels,
 		TotalFrames:      0,
 		TotalFramesKnown: false,
-	}))
+	}), owner)
 
-	seq, total, err := p.streamCloudAudio(responseID, body)
+	seq, total, err := p.streamCloudAudio(responseID, body, owner)
 	if err != nil {
+		// Legacy raw servers cannot distinguish abort from connection loss.
+		// Only an established partial audio answer qualifies for quiet stop.
+		var typed *cloudAudioFailure
+		if total > 0 && !errors.As(err, &typed) {
+			err = &cloudAudioFailure{kind: cloud.ResponseAudioErrorType_Transport, detail: err.Error()}
+		}
 		log.Println("Cloud audio: stream failed:", err)
-		p.sendCloudAudioError(responseID, err)
+		p.sendCloudAudioError(responseID, err, owner)
 		return
 	}
 	// seq is 0 when nothing was emitted, which also covers a body too short to hold
 	// a single 16-bit sample.
 	if total == 0 || seq == 0 {
-		p.sendCloudAudioError(responseID, errors.New("no audio returned"))
+		p.sendCloudAudioError(responseID, errors.New("no audio returned"), owner)
 		return
 	}
 
-	p.writeResponse(cloud.NewMessageWithResponseAudioEnd(&cloud.ResponseAudioEnd{
+	p.writeCloudAudio(cloud.NewMessageWithResponseAudioEnd(&cloud.ResponseAudioEnd{
 		ResponseId:          responseID,
 		FinalSequenceNumber: seq,
-	}))
+	}), owner)
 	log.Printf("Cloud audio: streamed %d bytes in %d chunks for %s\n", total, seq, responseID)
 }
 
 // streamCloudAudio forwards the response body to the engine in player-sized
 // chunks as the bytes arrive. It returns the number of chunks sent and the
 // total byte count read.
-func (p *Process) streamCloudAudio(responseID string, body io.Reader) (uint32, int, error) {
+func (p *Process) streamCloudAudio(responseID string, body io.Reader, owners ...cloudAudioOwner) (uint32, int, error) {
+	owner := p.getAudioOwner(owners)
 	var (
 		seq     uint32
 		total   int
@@ -128,11 +264,11 @@ func (p *Process) streamCloudAudio(responseID string, body io.Reader) (uint32, i
 	emit := func(data []byte) {
 		chunk := make([]byte, len(data))
 		copy(chunk, data)
-		p.writeResponse(cloud.NewMessageWithResponseAudioChunk(&cloud.ResponseAudioChunk{
+		p.writeCloudAudio(cloud.NewMessageWithResponseAudioChunk(&cloud.ResponseAudioChunk{
 			ResponseId:     responseID,
 			SequenceNumber: seq,
 			Data:           chunk,
-		}))
+		}), owner)
 		seq++
 	}
 
@@ -141,7 +277,7 @@ func (p *Process) streamCloudAudio(responseID string, body io.Reader) (uint32, i
 		if n > 0 {
 			total += n
 			if total > cloudAudioMaxBytes {
-				return seq, total, errors.New("answer audio exceeds maximum size")
+				return seq, total, &cloudAudioFailure{kind: cloud.ResponseAudioErrorType_TooLarge, detail: "answer audio exceeds maximum size"}
 			}
 			pending = append(pending, buf[:n]...)
 			// Emit only whole chunks of whole 16-bit frames; a partial frame
@@ -161,19 +297,28 @@ func (p *Process) streamCloudAudio(responseID string, body io.Reader) (uint32, i
 		}
 	}
 
-	// Flush whatever is left, dropping a trailing odd byte.
+	if len(pending)%2 != 0 {
+		return seq, total, &cloudAudioFailure{kind: cloud.ResponseAudioErrorType_InvalidFormat, detail: "incomplete PCM sample"}
+	}
+	// Flush the remaining complete samples only after successful termination.
 	if tail := len(pending) - len(pending)%2; tail > 0 {
 		emit(pending[:tail])
 	}
 	return seq, total, nil
 }
 
-func (p *Process) sendCloudAudioError(responseID string, err error) {
-	p.writeResponse(cloud.NewMessageWithResponseAudioError(&cloud.ResponseAudioError{
+func (p *Process) sendCloudAudioError(responseID string, err error, owners ...cloudAudioOwner) {
+	owner := p.getAudioOwner(owners)
+	kind := cloud.ResponseAudioErrorType_Provider
+	var typed *cloudAudioFailure
+	if errors.As(err, &typed) {
+		kind = typed.kind
+	}
+	p.writeCloudAudio(cloud.NewMessageWithResponseAudioError(&cloud.ResponseAudioError{
 		ResponseId: responseID,
-		Error:      cloud.ResponseAudioErrorType_Provider,
+		Error:      kind,
 		Details:    err.Error(),
-	}))
+	}), owner)
 }
 
 // openCloudAudio starts the answer-audio request and returns the response body
@@ -184,8 +329,8 @@ func (p *Process) sendCloudAudioError(responseID string, err error) {
 // style path and needs no text-to-speech configuration on the robot. Otherwise
 // the answer text is POSTed to a generic synthesis endpoint.
 //
-// Either way the body is raw 16 kHz mono signed 16-bit little-endian PCM,
-// delivered incrementally.
+// Handle requests negotiate framed outcomes, decoded here into incremental
+// 16 kHz mono s16le PCM. Older servers and generic POSTs still use raw PCM.
 func openCloudAudio(endpoint, audioID, text string) (io.ReadCloser, error) {
 	client := &http.Client{Timeout: cloudAudioTimeout}
 
@@ -213,6 +358,9 @@ func openCloudAudio(endpoint, audioID, text string) (io.ReadCloser, error) {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/octet-stream")
+	if audioID != "" {
+		req.Header.Set("Accept", cloudAudioFramedType)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -221,6 +369,10 @@ func openCloudAudio(endpoint, audioID, text string) (io.ReadCloser, error) {
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
 		return nil, fmt.Errorf("answer audio endpoint returned status %d", resp.StatusCode)
+	}
+	contentType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if audioID != "" && contentType == cloudAudioFramedType {
+		return &framedCloudAudio{ReadCloser: resp.Body}, nil
 	}
 	return resp.Body, nil
 }

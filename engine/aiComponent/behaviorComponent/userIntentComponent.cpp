@@ -49,6 +49,8 @@
 #include "json/json.h"
 
 #define LOG_CHANNEL "BehaviorSystem"
+#include "engine/aiComponent/behaviorComponent/conversationSessionComponent.h"
+#include "engine/aiComponent/behaviorComponent/knowledgeFollowUpRouting.h"
 
 namespace Anki {
 namespace Vector {
@@ -96,12 +98,22 @@ UserIntentComponent::UserIntentComponent(const Robot& robot, const Json::Value& 
     const auto& twd = event.GetData().Get_triggerWordDetected();
     const bool willStream = twd.willOpenStream;
     const bool muteEdgeCase = twd.fromMute;
-    SetTriggerWordPending(willStream, muteEdgeCase);
+    SetTriggerWordPending(willStream, muteEdgeCase, twd.streamId);
 
     HandleTriggerWordEventForDas(event.GetData().Get_triggerWordDetected());
   };
 
   if( robot.GetRobotMessageHandler() != nullptr ) {
+    _eventHandles.push_back(robot.GetRobotMessageHandler()->Subscribe(
+      RobotInterface::RobotToEngineTag::micStreamState,
+      [this](const AnkiEvent<RobotInterface::RobotToEngine>& event) {
+        const auto& state = event.GetData().Get_micStreamState();
+        _micMuted = state.muted;
+        if (state.streamId != _expectedStreamId) { return; }
+        _captureStreamId = state.streamId;
+        _captureOpen = state.open;
+        _captureStateKnown = true;
+      }));
     _eventHandles.push_back( robot.GetRobotMessageHandler()->Subscribe( RobotInterface::RobotToEngineTag::triggerWordDetected,
                                                                         triggerWordCallback ) );
   }
@@ -142,7 +154,7 @@ void UserIntentComponent::ClearPendingTriggerWord()
   }
 }
 
-void UserIntentComponent::SetTriggerWordPending(const bool willOpenStream, const bool muteEdgeCase)
+void UserIntentComponent::SetTriggerWordPending(const bool willOpenStream, const bool muteEdgeCase, uint32_t streamId)
 {
   const float currTime_s = BaseStationTimer::getInstance()->GetCurrentTimeInSeconds();
 
@@ -170,6 +182,20 @@ void UserIntentComponent::SetTriggerWordPending(const bool willOpenStream, const
   }
 
   _pendingTrigger = true;
+  if (_conversation) { _conversation->Policy().End("wake_word"); }
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _expectedStreamId = streamId;
+    _automaticListening = false;
+    _acceptStreamResults = true;
+    _streamResultReceived = false;
+    _captureStateKnown = false;
+    _isStreamOpen = false;
+    _wasIntentError = false;
+    _cloudEvents.clear();
+    _cloudAudio.Reset();
+    _cloudAudioExpectedId.clear();
+  }
   _pendingTriggerWillStream = willOpenStream;
   const auto ticksToClear = muteEdgeCase ? kMaxTicksToClear_Extended : kMaxTicksToClear;
   const auto currTick = BaseStationTimer::getInstance()->GetTickCount();
@@ -224,6 +250,17 @@ UserIntentPtr UserIntentComponent::ActivateUserIntent(UserIntentTag userIntent, 
 
   _activeIntent = std::move(_pendingIntent);
   _activeIntent->activationID = ++sActivatedIntentID;
+  if (_conversation) {
+    const bool eligible = userIntent == USER_INTENT(knowledge_question) ||
+                          userIntent == USER_INTENT(knowledge_response_bypass);
+    if (_conversation->IsEnabled()) {
+      _conversation->Policy().Claimed(_activeIntent->activationID, eligible,
+        _activeIntent->source == UserIntentSource::Voice,
+        BaseStationTimer::getInstance()->GetCurrentTimeInSecondsDouble());
+    } else {
+      _conversation->Policy().End("disabled");
+    }
+  }
 
   // track the owner for easier debugging
   _activeIntentOwner = owner;
@@ -259,6 +296,10 @@ void UserIntentComponent::DeactivateUserIntent(UserIntentTag userIntent)
             "Deactivating intent '%s' (activated by %s)",
             UserIntentTagToString(userIntent),
             _activeIntentOwner.c_str());
+  if (_conversation) {
+    _conversation->Policy().Deactivated(_activeIntent->activationID,
+      BaseStationTimer::getInstance()->GetCurrentTimeInSecondsDouble());
+  }
   _activeIntent.reset();
   _activeIntentOwner.clear();
 
@@ -794,9 +835,21 @@ void UserIntentComponent::UpdateDependent(const BCCompMap& dependentComps)
   {
     std::lock_guard<std::mutex> lock{_mutex};
     if (_pendingCloudIntent.GetTag() != CloudMic::MessageTag::INVALID) {
+      _cloudEvents.push_back(std::move(_pendingCloudIntent));
+      _pendingCloudIntent = {};
+    }
+    while (!_cloudEvents.empty()) {
+      _pendingCloudIntent = std::move(_cloudEvents.front());
+      _cloudEvents.pop_front();
       switch ( _pendingCloudIntent.GetTag() ) {
         case CloudMic::MessageTag::result:
         {
+          if (_expectedStreamId != 0 && _streamResultReceived) { break; }
+          if (_automaticListening && _conversation &&
+              !_conversation->Policy().CanReceiveResult(
+                BaseStationTimer::getInstance()->GetCurrentTimeInSecondsDouble())) {
+            break;
+          }
           auto json = _pendingCloudIntent.Get_result().GetJSON();
           bool ok = true;
           if ( json[kAltParamsKey].isString() ) {
@@ -816,8 +869,35 @@ void UserIntentComponent::UpdateDependent(const BCCompMap& dependentComps)
             }
             json.removeMember(kAltParamsKey);
           }
+          if (_automaticListening && _conversation) {
+            const char* terminal = ok ? PrepareKnowledgeFollowUpResult(json) : "malformed_result";
+            if (terminal != nullptr) {
+              _conversation->Policy().End(terminal);
+              ok = false;
+            }
+          }
           if ( ok ) {
-            SetIntentPendingFromCloudJSONValue( std::move( json ) );
+            ok = SetIntentPendingFromCloudJSONValue( std::move( json ) );
+          }
+          _streamResultReceived = true;
+          if (_conversation && _automaticListening) {
+            if (!ok) {
+              // This owned result is terminal; no renderer will consume its prebuffered audio.
+              // _mutex is already held, so do not call ClearCloudAudio here.
+              _acceptStreamResults = false;
+              _cloudEvents.clear();
+              _cloudAudio.Reset();
+              _cloudAudioExpectedId.clear();
+            }
+            auto& policy = _conversation->Policy();
+            if (ok && (IsUserIntentPending(USER_INTENT(silence)) ||
+                IsUserIntentPending(USER_INTENT(unmatched_intent)))) {
+              policy.End(IsUserIntentPending(USER_INTENT(silence)) ? "silence" : "unmatched");
+              DropAnyUserIntent();
+            } else {
+              policy.Result(ok && IsUserIntentPending(USER_INTENT(knowledge_response_bypass)),
+                            BaseStationTimer::getInstance()->GetCurrentTimeInSecondsDouble());
+            }
           }
           _isStreamOpen = false;
           _pendingTriggerWillStream = false;
@@ -835,17 +915,22 @@ void UserIntentComponent::UpdateDependent(const BCCompMap& dependentComps)
         case CloudMic::MessageTag::error:
         {
           LOG_WARNING("UserIntentComponent.UpdatePendingIntent.GotError",
-                      "Got cloud error message type %s",
-                      CloudMic::MessageTagToString( _pendingCloudIntent.GetTag()));
+                      "Got cloud error message type %s kind %s stream=%u",
+                      CloudMic::MessageTagToString(_pendingCloudIntent.GetTag()),
+                      _pendingCloudIntent.GetTag() == CloudMic::MessageTag::error ?
+                        ErrorTypeToString(_pendingCloudIntent.Get_error().error) : "Timeout",
+                      _expectedStreamId);
 
           {
             DASMSG( robot_cloud_response_failed, "robot.cloud_response_failed", "Invalid response received from the cloud" );
-            DASMSG_SET( s1, ErrorTypeToString( _pendingCloudIntent.Get_error().error ), "The error string" );
+            DASMSG_SET( s1, _pendingCloudIntent.GetTag() == CloudMic::MessageTag::error ?
+                        ErrorTypeToString(_pendingCloudIntent.Get_error().error) : "Timeout", "The error string" );
             DASMSG_SET( i1, (int)(_pendingCloudIntent.GetTag() == CloudMic::MessageTag::error), "Whether it was a timeout (0) or error (1) " );
             DASMSG_SEND();
           }
 
           _wasIntentError = true;
+          if (_conversation) { _conversation->Policy().End("transport_error"); }
           _isStreamOpen = false;
           _pendingTriggerWillStream = false;
           break;
@@ -857,6 +942,12 @@ void UserIntentComponent::UpdateDependent(const BCCompMap& dependentComps)
           _isStreamOpen = true;
           break;
         }
+        case CloudMic::MessageTag::streamClosed:
+          _isStreamOpen = false;
+          if (_conversation && !_streamResultReceived && _automaticListening) {
+            _conversation->Policy().End("stream_closed_without_result");
+          }
+          break;
 
         default:
           LOG_WARNING("UserIntentComponent.UpdatePendingIntent.SkipOther",
@@ -939,7 +1030,29 @@ void UserIntentComponent::UpdateDependent(const BCCompMap& dependentComps)
 
 void UserIntentComponent::StartWakeWordlessStreaming( CloudMic::StreamType streamType, bool playGetInFromAnimProcess )
 {
-  RobotInterface::StartWakeWordlessStreaming message{ static_cast<uint8_t>(streamType), playGetInFromAnimProcess};
+  // Ordinary callers supersede any automatic capture, except the prompted KG
+  // sub-request belonging to the current responding turn.
+  if (_conversation && streamType != CloudMic::StreamType::KnowledgeGraph) {
+    _conversation->Policy().End("other_capture");
+  }
+  const auto streamId = AllocateStreamId();
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _expectedStreamId = streamId;
+    _automaticListening = false;
+    _acceptStreamResults = true;
+    _streamResultReceived = false;
+    _captureStateKnown = false;
+    _isStreamOpen = false;
+    _wasIntentError = false;
+    _cloudEvents.clear();
+    _cloudAudio.Reset();
+    _cloudAudioExpectedId.clear();
+  }
+  RobotInterface::StartWakeWordlessStreaming message;
+  message.streamType = static_cast<uint8_t>(streamType);
+  message.playGetInFromAnimProcess = playGetInFromAnimProcess;
+  message.streamId = streamId;
   _robot->SendMessage( RobotInterface::EngineToRobot( std::move(message) ) );
   if (playGetInFromAnimProcess) {
     _waitingForTriggerWordGetInToFinish = HasAnimResponseToTriggerWord();
@@ -947,6 +1060,49 @@ void UserIntentComponent::StartWakeWordlessStreaming( CloudMic::StreamType strea
   }
 }
 
+void UserIntentComponent::StartFollowUpStreaming(uint32_t streamId)
+{
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _expectedStreamId = streamId;
+    _automaticListening = true;
+    _acceptStreamResults = true;
+    _streamResultReceived = false;
+    _captureStateKnown = false;
+    _isStreamOpen = false;
+    _wasIntentError = false;
+    _wasIntentUnclaimed = false;
+    _cloudEvents.clear();
+    _pendingCloudIntent = {};
+    _cloudAudio.Reset();
+    _cloudAudioExpectedId.clear();
+  }
+  RobotInterface::StartWakeWordlessStreaming message;
+  message.streamType = static_cast<uint8_t>(CloudMic::StreamType::KnowledgeGraph);
+  message.playGetInFromAnimProcess = false;
+  message.streamId = streamId;
+  message.freshCapture = true;
+  _robot->SendMessage(RobotInterface::EngineToRobot(std::move(message)));
+}
+
+void UserIntentComponent::StopConversationStream(uint32_t streamId, bool rejectResults)
+{
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (streamId == _expectedStreamId && rejectResults) {
+      _acceptStreamResults = false;
+      _isStreamOpen = false;
+      _pendingTriggerWillStream = false;
+      _cloudEvents.clear();
+      _pendingCloudIntent = {};
+      _cloudAudio.Reset();
+      _cloudAudioExpectedId.clear();
+    }
+  }
+  RobotInterface::StopWakeWordlessStreaming message;
+  message.streamId = streamId;
+  _robot->SendMessage(RobotInterface::EngineToRobot(std::move(message)));
+}
 
 void UserIntentComponent::PushResponseToTriggerWord(const std::string& id, const TriggerWordResponseData& newState)
 {
@@ -1146,6 +1302,20 @@ void UserIntentComponent::OnCloudData(CloudMic::Message&& data)
 
   std::lock_guard<std::mutex> lock{_mutex};
 
+  uint32_t streamId = 0;
+  switch (data.GetTag()) {
+    case CloudMic::MessageTag::result: streamId = data.Get_result().streamId; break;
+    case CloudMic::MessageTag::error: streamId = data.Get_error().streamId; break;
+    case CloudMic::MessageTag::streamOpen: streamId = data.Get_streamOpen().streamId; break;
+    case CloudMic::MessageTag::streamClosed: streamId = data.Get_streamClosed().streamId; break;
+    case CloudMic::MessageTag::responseAudioStart: streamId = data.Get_responseAudioStart().streamId; break;
+    case CloudMic::MessageTag::responseAudioChunk: streamId = data.Get_responseAudioChunk().streamId; break;
+    case CloudMic::MessageTag::responseAudioEnd: streamId = data.Get_responseAudioEnd().streamId; break;
+    case CloudMic::MessageTag::responseAudioError: streamId = data.Get_responseAudioError().streamId; break;
+    default: break;
+  }
+  if (!_acceptStreamResults || streamId != _expectedStreamId) { return; }
+  if (data.GetTag() == CloudMic::MessageTag::result && _streamResultReceived) { return; }
   switch ( data.GetTag() ) {
     case CloudMic::MessageTag::responseAudioStart:
     case CloudMic::MessageTag::responseAudioChunk:
@@ -1160,7 +1330,9 @@ void UserIntentComponent::OnCloudData(CloudMic::Message&& data)
       break;
   }
 
-  _pendingCloudIntent = std::move(data);
+  // Open/result/closed can arrive within one engine tick. None may overwrite
+  // another (especially streamClosed replacing the result).
+  if (_cloudEvents.size() < 32) { _cloudEvents.push_back(std::move(data)); }
 }
 
 namespace {
@@ -1255,8 +1427,14 @@ void UserIntentComponent::HandleCloudResponseAudio(const CloudMic::Message& data
         _cloudAudio.responseId = err.responseId;
       }
       _cloudAudio.hasError = true;
+      _cloudAudio.interrupted =
+        err.error == CloudMic::ResponseAudioErrorType::Cancelled ||
+        err.error == CloudMic::ResponseAudioErrorType::Transport;
+      _cloudAudio.complete = false;
+      _cloudAudio.pcm.clear();
       LOG_WARNING("UserIntentComponent.CloudAudio.Error",
-                  "responseId=%s details=%s", err.responseId.c_str(), err.details.c_str());
+                  "responseId=%s type=%u details=%s", err.responseId.c_str(),
+                  static_cast<unsigned>(err.error), err.details.c_str());
       break;
     }
 
@@ -1287,6 +1465,12 @@ bool UserIntentComponent::HasCloudAudioError(const std::string& responseId)
 {
   std::lock_guard<std::mutex> lock{_mutex};
   return _cloudAudio.responseId == responseId && _cloudAudio.hasError;
+}
+
+bool UserIntentComponent::HasCloudAudioInterruption(const std::string& responseId)
+{
+  std::lock_guard<std::mutex> lock{_mutex};
+  return _cloudAudio.responseId == responseId && _cloudAudio.hasError && _cloudAudio.interrupted;
 }
 
 bool UserIntentComponent::HasCloudAudioStarted(const std::string& responseId)
@@ -1334,9 +1518,14 @@ void UserIntentComponent::SetExpectedCloudAudioResponse(const std::string& respo
   }
 }
 
-void UserIntentComponent::ClearCloudAudio()
+void UserIntentComponent::ClearCloudAudio(const std::string& responseId)
 {
   std::lock_guard<std::mutex> lock{_mutex};
+  if (!responseId.empty() &&
+      ((!_cloudAudioExpectedId.empty() && responseId != _cloudAudioExpectedId) ||
+       (_cloudAudio.haveStart && responseId != _cloudAudio.responseId))) {
+    return;
+  }
   _cloudAudio.Reset();
   _cloudAudioExpectedId.clear();
 }

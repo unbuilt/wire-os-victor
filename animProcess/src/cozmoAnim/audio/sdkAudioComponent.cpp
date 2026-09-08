@@ -64,6 +64,7 @@ SdkAudioComponent::~SdkAudioComponent() {
 //
 void SdkAudioComponent::HandleMessage(const RobotInterface::ExternalAudioComplete& msg)
 {
+  if (msg.playbackId != _playbackId) { return; }
   if (ANKI_VERIFY(_audioPrepared, 
                     "SdkAudioComponent.HandleMessage.ExternalAudioComplete", 
                     "Audio stream complete message received without start")) {
@@ -87,6 +88,7 @@ void SdkAudioComponent::HandleMessage(const RobotInterface::ExternalAudioComplet
 //
 void SdkAudioComponent::HandleMessage(const RobotInterface::ExternalAudioCancel& msg)
 {
+  if (msg.playbackId != _playbackId) { return; }
   if (ANKI_VERIFY(_audioPrepared, 
                     "SdkAudioComponent.HandleMessage.ExternalAudioCancel", 
                     "Audio stream cancel message received without start")) {
@@ -100,12 +102,17 @@ void SdkAudioComponent::HandleMessage(const RobotInterface::ExternalAudioCancel&
 //
 void SdkAudioComponent::HandleMessage(const RobotInterface::ExternalAudioPrepare& msg)
 {
+  // Report rejection against the new request, without relabelling the player
+  // which is already running.
+  const auto previousId = _playbackId;
+  _playbackId = msg.playbackId;
   LOG_DEBUG("SdkAudioComponent.HandleMessage.ExternalAudioPrepare", 
            "Sample rate %d, volume %d", msg.audio_volume, msg.audio_rate );
 
   if (!PrepareAudioEngine(msg)) {
     LOG_DEBUG("SdkAudioComponent.HandleMessage.ExternalAudioPrepare", "Unable to prepare audio engine for streaming");
     SendAnimToEngine(SDKAudioStreamingState::PrepareFailed);
+    _playbackId = previousId;
     if (!_audioPrepared) {
       ClearOperationData();
     }
@@ -118,6 +125,7 @@ void SdkAudioComponent::HandleMessage(const RobotInterface::ExternalAudioPrepare
 //
 void SdkAudioComponent::HandleMessage(const RobotInterface::ExternalAudioChunk& msg)
 {
+  if (msg.playbackId != _playbackId) { return; }
   if (!_audioPrepared) {
     LOG_DEBUG("SdkAudioComponent.HandleMessage.ExternalAudioChunk", "Dropping chunks due to cancellation");
     return;
@@ -372,6 +380,7 @@ bool SdkAudioComponent::SendAnimToEngine(SDKAudioStreamingState audioState, uint
   evt.streamResultID = audioState;
   evt.audioReceived = audioSent;  //used only for ChunkAdded messages
   evt.audioPlayed = audioPlayed;  //used only for ChunkAdded messages
+  evt.playbackId = _playbackId;
   return AnimProcessMessages::SendAnimToEngine(std::move(evt));
 }
 

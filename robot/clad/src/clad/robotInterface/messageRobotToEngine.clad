@@ -57,11 +57,20 @@ message AlexaUXChanged {
 // Indicates the robot has heard the trigger word
 message TriggerWordDetected
 {
+  uint_32 streamId = 0,
   uint_32 triggerScore,
   uint_16 direction,
   bool isButtonPress,
   bool fromMute,
   bool willOpenStream,
+}
+
+// False acknowledges that this capture can no longer collect or send samples.
+message MicStreamState
+{
+  uint_32 streamId,
+  bool open,
+  bool muted = 0
 }
 
 message MicDirection
@@ -122,6 +131,10 @@ message MicData
   uint_32 timestamp,
   uint_32 robotStatusFlags, // RobotStatusFlag packs as a uint_32
   float_32 robotRotationAngle,
+  uint_32 sourceFirstFrame, // syscon transmit sequence, NOT a DMA acquisition counter
+  uint_64 sourceReceivedNs, // host CLOCK_MONOTONIC at parsing the last spine frame
+  uint_32 sourceLastFrame,
+  bool sourceTimingValid,
 }
 
 message AudioPlaybackBegin
@@ -225,6 +238,7 @@ union RobotToEngine {
   StartShutdownAnim          startShutdownAnim      = 0xD0,
 
   ReportCloudConnectivity    reportCloudConnectivity = 0xD1,
+  MicStreamState             micStreamState          = 0xD2,
 
   AnimationAdded             animAdded              = 0xD3,
   RobotAvailable             robotAvailable         = 0xD4,

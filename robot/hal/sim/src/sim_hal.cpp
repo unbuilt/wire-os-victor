@@ -850,7 +850,7 @@ namespace Anki {
         }
 
         if (_numMicMsgsSent < kMaxNumMicMsgsAllowedPerSendWindow) {
-          sendDataFunc(micData_.front().data(), kInterleavedSamplesPerChunk);
+          sendDataFunc(micData_.front().data(), kInterleavedSamplesPerChunk, 0, 0, false);
           ++_numMicMsgsSent;
         }
 

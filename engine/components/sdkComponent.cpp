@@ -798,11 +798,12 @@ void SDKComponent::HandleAudioStreamCancelRequest(const AnkiEvent<external_inter
   }
 }
 
-void SDKComponent::PrepareStreamingAudio(uint16_t audioRate, uint16_t audioVolume)
+void SDKComponent::PrepareStreamingAudio(uint16_t audioRate, uint16_t audioVolume, uint32_t playbackId)
 {
   RobotInterface::ExternalAudioPrepare msg;
   msg.audio_volume = audioVolume;
   msg.audio_rate = audioRate;
+  msg.playbackId = playbackId;
 
   const Result result = _robot->SendMessage(RobotInterface::EngineToRobot(std::move(msg)));
   if (RESULT_OK != result) {
@@ -810,7 +811,7 @@ void SDKComponent::PrepareStreamingAudio(uint16_t audioRate, uint16_t audioVolum
   }
 }
 
-void SDKComponent::SendStreamingAudioChunk(const uint8_t* data, uint16_t sizeBytes)
+void SDKComponent::SendStreamingAudioChunk(const uint8_t* data, uint16_t sizeBytes, uint32_t playbackId)
 {
   if (!ANKI_VERIFY(sizeBytes <= 1024,
         "SDKComponent.SendStreamingAudioChunk", "Invalid audio playback chunk size %u", sizeBytes)) {
@@ -818,6 +819,7 @@ void SDKComponent::SendStreamingAudioChunk(const uint8_t* data, uint16_t sizeByt
   }
 
   RobotInterface::ExternalAudioChunk msg;
+  msg.playbackId = playbackId;
   msg.audio_chunk_size = sizeBytes;
   msg.audio_chunk_data.fill(0);
   std::memcpy(msg.audio_chunk_data.data(), data, sizeBytes);
@@ -828,18 +830,20 @@ void SDKComponent::SendStreamingAudioChunk(const uint8_t* data, uint16_t sizeByt
   }
 }
 
-void SDKComponent::CompleteStreamingAudio()
+void SDKComponent::CompleteStreamingAudio(uint32_t playbackId)
 {
   RobotInterface::ExternalAudioComplete msg;
+  msg.playbackId = playbackId;
   const Result result = _robot->SendMessage(RobotInterface::EngineToRobot(std::move(msg)));
   if (RESULT_OK != result) {
     LOG_ERROR("SDKComponent.CompleteStreamingAudio", "Send Audio Stream Complete Message to Robot failed");
   }
 }
 
-void SDKComponent::CancelStreamingAudio()
+void SDKComponent::CancelStreamingAudio(uint32_t playbackId)
 {
   RobotInterface::ExternalAudioCancel msg;
+  msg.playbackId = playbackId;
   const Result result = _robot->SendMessage(RobotInterface::EngineToRobot(std::move(msg)));
   if (RESULT_OK != result) {
     LOG_ERROR("SDKComponent.CancelStreamingAudio", "Send Audio Stream Cancel Message to Robot failed");

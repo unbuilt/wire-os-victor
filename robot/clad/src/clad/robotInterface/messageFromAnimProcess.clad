@@ -96,6 +96,7 @@ message AudioStreamStatusEvent
 {
   uint_32 audioReceived,
   uint_32 audioPlayed,
+  uint_32 playbackId = 0,
   SDKAudioStreamingState streamResultID
 }
 

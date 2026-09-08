@@ -83,6 +83,7 @@ private:
 
   // Set up Audio Engine to play text's audio data
   bool PrepareAudioEngine(const RobotInterface::ExternalAudioPrepare& msg );
+  uint32_t _playbackId = 0;
   bool AddAudioChunk(const RobotInterface::ExternalAudioChunk& msg );
   bool PostAudioEvent();    
   void ReportProgress();

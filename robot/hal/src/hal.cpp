@@ -484,10 +484,14 @@ Result HAL::Init(const int * shutdownSignal)
   return RESULT_OK;
 }  // Init()
 
+static uint64_t micFrameReceivedNs_ = 0;
+
 void handle_payload_data(const uint8_t frame_buffer[]) {
 
   memcpy(frameBuffer_, frame_buffer, sizeof(frameBuffer_));
   bodyData_ = (BodyToHead*)(frameBuffer_ + sizeof(struct SpineMessageHeader));
+  micFrameReceivedNs_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
 
   if (ccc_commander_is_active()) {
     ccc_payload_process(bodyData_);
@@ -1062,7 +1066,8 @@ bool HAL::HandleLatestMicData(SendDataFunction sendDataFunc)
 {
   #if MICDATA_ENABLED
   {
-    sendDataFunc(bodyData_->audio, MICDATA_SAMPLES_COUNT);
+    sendDataFunc(bodyData_->audio, MICDATA_SAMPLES_COUNT, bodyData_->framecounter,
+                 micFrameReceivedNs_, haveValidSyscon_ && micFrameReceivedNs_ != 0);
   }
   #endif
   return false;

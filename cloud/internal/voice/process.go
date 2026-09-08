@@ -47,7 +47,8 @@ type Process struct {
 	opts      options
 	// writeMu serializes writeResponse so the cloud-audio goroutine and the main
 	// process loop don't interleave datagram writes to the engine socket.
-	writeMu sync.Mutex
+	writeMu    sync.Mutex
+	audioOwner cloudAudioOwner
 }
 
 // AddReceiver adds the given Receiver to the list of sources the
@@ -103,10 +104,12 @@ func (p *Process) AddIntentWriter(s MsgSender) {
 
 type strmReceiver struct {
 	stream     *stream.Streamer
+	streamID   uint32
 	intent     chan cloudIntent
 	err        chan cloudError
 	open       chan cloudOpen
 	connection chan cloudConnCheck
+	done       chan struct{}
 }
 
 func (c *strmReceiver) OnIntent(r *cloud.IntentResult) {
@@ -114,15 +117,24 @@ func (c *strmReceiver) OnIntent(r *cloud.IntentResult) {
 		log.Println("Unexpected intent result on receiver:", r)
 		return
 	}
-	c.intent <- cloudIntent{c, r}
+	select {
+	case c.intent <- cloudIntent{c, r}:
+	case <-c.done:
+	}
 }
 
 func (c *strmReceiver) OnError(kind cloud.ErrorType, err error) {
-	c.err <- cloudError{c, kind, err}
+	select {
+	case c.err <- cloudError{c, kind, err}:
+	case <-c.done:
+	}
 }
 
 func (c *strmReceiver) OnStreamOpen(session string) {
-	c.open <- cloudOpen{c, session}
+	select {
+	case c.open <- cloudOpen{c, session}:
+	case <-c.done:
+	}
 }
 
 func (c *strmReceiver) OnConnectionResult(r *cloud.ConnectionResult) {
@@ -130,18 +142,14 @@ func (c *strmReceiver) OnConnectionResult(r *cloud.ConnectionResult) {
 		log.Println("Unexpected connection check result on receiver:", r)
 		return
 	}
-	c.connection <- cloudConnCheck{c, r}
+	select {
+	case c.connection <- cloudConnCheck{c, r}:
+	case <-c.done:
+	}
 }
 
 func (c *strmReceiver) Close() {
-	if c.intent != nil {
-		close(c.intent)
-	}
-	close(c.err)  // should never be nil
-	close(c.open) // should never be nil
-	if c.connection != nil {
-		close(c.connection)
-	}
+	close(c.done)
 }
 
 // Run starts the cloud process, which will run until stopped on the given channel
@@ -156,6 +164,7 @@ func (p *Process) Run(ctx context.Context, options ...Option) {
 	}
 
 	cloudChans := &strmReceiver{
+		done:   make(chan struct{}),
 		intent: make(chan cloudIntent),
 		err:    make(chan cloudError),
 		open:   make(chan cloudOpen),
@@ -163,6 +172,7 @@ func (p *Process) Run(ctx context.Context, options ...Option) {
 	defer cloudChans.Close()
 
 	connCheck := &strmReceiver{
+		done:       make(chan struct{}),
 		err:        make(chan cloudError),
 		open:       make(chan cloudOpen),
 		connection: make(chan cloudConnCheck),
@@ -170,6 +180,9 @@ func (p *Process) Run(ctx context.Context, options ...Option) {
 	defer connCheck.Close()
 
 	var strm *stream.Streamer
+	var streamID uint32
+	var streamStarted time.Time
+	var receivedSamples int
 procloop:
 	for {
 		// the cases in this select should NOT block! if messages that others send us
@@ -184,6 +197,10 @@ procloop:
 					if err := strm.Close(); err != nil {
 						log.Println("Error closing context:")
 					}
+					// The new hotword already owns mic capture. In particular,
+					// legacy ID zero must not receive a stop for its predecessor.
+					p.signalStreamClosed(streamID)
+					strm = nil
 				}
 
 				// if this is from a test receiver, notify the mic to send the AI a hotword on our behalf
@@ -192,10 +209,17 @@ procloop:
 				}
 
 				hw := msg.msg.GetHotword()
+				streamID = hw.StreamId
+				streamStarted = time.Now()
+				receivedSamples = 0
+				log.Printf("Voice stream open: stream=%d mode=%d", streamID, hw.Mode)
+				p.beginAudioOwner(streamID)
 				mode := hw.Mode
 				serverMode, ok := modeMap[mode]
 				if !ok && mode != cloud.StreamType_KnowledgeGraph {
-					p.writeError(cloud.ErrorType_InvalidConfig, fmt.Errorf("unknown mode %d", mode))
+					p.writeError(cloud.ErrorType_InvalidConfig, fmt.Errorf("unknown mode %d", mode), streamID)
+					p.signalMicStop(streamID)
+					p.signalStreamClosed(streamID)
 					continue
 				}
 
@@ -205,7 +229,9 @@ procloop:
 				}
 				language, err := getLanguage(locale)
 				if err != nil {
-					p.writeError(cloud.ErrorType_InvalidConfig, err)
+					p.writeError(cloud.ErrorType_InvalidConfig, err, streamID)
+					p.signalMicStop(streamID)
+					p.signalStreamClosed(streamID)
 					continue
 				}
 
@@ -231,6 +257,7 @@ procloop:
 				}
 				logVerbose("Got hotword event", serverMode)
 				newReceiver := *cloudChans
+				newReceiver.streamID = streamID
 				strm = p.newStream(ctx, &newReceiver, option)
 				newReceiver.stream = strm
 
@@ -239,7 +266,9 @@ procloop:
 
 			case cloud.MessageTag_AudioDone:
 				// no more audio is coming - close send on the stream
-				if strm != nil {
+				if strm != nil && msg.msg.GetAudioDone().StreamId == streamID {
+					log.Printf("Voice mic done: stream=%d audio_ms=%d elapsed_ms=%d",
+						streamID, receivedSamples/16, time.Since(streamStarted).Milliseconds())
 					logVerbose("Got notification mic is done sending audio")
 					if err := strm.CloseSend(); err != nil {
 						log.Println("Error closing stream send:", err)
@@ -249,11 +278,26 @@ procloop:
 			case cloud.MessageTag_Audio:
 				// add samples to our buffer
 				buf := msg.msg.GetAudio().Data
-				if strm != nil {
+				if strm != nil && msg.msg.GetAudio().StreamId == streamID {
+					if receivedSamples == 0 {
+						log.Printf("Voice first audio: stream=%d elapsed_ms=%d",
+							streamID, time.Since(streamStarted).Milliseconds())
+					}
+					receivedSamples += len(buf)
 					strm.AddSamples(buf)
 				} else {
 					logVerbose("No active context, discarding", len(buf), "samples")
 				}
+
+			case cloud.MessageTag_CancelStream:
+				id := msg.msg.GetCancelStream().StreamId
+				p.cancelAudioOwner(id)
+				if strm != nil && id == streamID {
+					strm.Close()
+					strm = nil
+					p.signalMicStop(id)
+				}
+				p.signalStreamClosed(id)
 
 			case cloud.MessageTag_ConnectionCheck:
 				logVerbose("Got connection check request")
@@ -263,7 +307,11 @@ procloop:
 					if err := strm.Close(); err != nil {
 						log.Println("Error closing context:")
 					}
+					p.signalMicStop(streamID)
+					p.signalStreamClosed(streamID)
 				}
+				streamID = 0
+				p.beginAudioOwner(0)
 
 				chipperOpts := p.defaultChipperOptions(cloud.StreamType_Normal)
 				connectOpts := chipper.ConnectOpts{
@@ -276,16 +324,19 @@ procloop:
 			}
 
 		case intent := <-cloudChans.intent:
-			if intent.recvr.stream != strm {
-				log.Println("Ignoring result from prior stream:", intent.result)
+			if !isCurrentStream(intent.recvr, strm, streamID) {
+				log.Println("Ignoring result from prior stream")
 				continue
 			}
 			logVerbose("Received intent from cloud:", intent.result)
 
 			// we got an answer from the cloud, tell mic to stop...
-			p.signalMicStop()
+			log.Printf("Voice stream result: stream=%d intent=%s audio_ms=%d elapsed_ms=%d",
+				streamID, intent.result.Intent, receivedSamples/16, time.Since(streamStarted).Milliseconds())
+			p.signalMicStop(streamID)
 
 			// send intent to AI
+			intent.result.StreamId = streamID
 			p.writeResponse(cloud.NewMessageWithResult(intent.result))
 
 			// If this was a Knowledge Graph answer advertising cloud audio, fetch
@@ -298,15 +349,18 @@ procloop:
 				log.Println("Error closing context:")
 			}
 			strm = nil
+			p.signalStreamClosed(streamID)
 
 		case err := <-cloudChans.err:
-			if err.recvr.stream != strm {
+			if !isCurrentStream(err.recvr, strm, streamID) {
 				log.Println("Ignoring error from prior stream:", err.err)
 				continue
 			}
 			logVerbose("Received error from cloud:", err.err)
-			p.signalMicStop()
-			p.writeError(err.kind, err.err)
+			log.Printf("Voice stream error: stream=%d kind=%d audio_ms=%d elapsed_ms=%d",
+				streamID, err.kind, receivedSamples/16, time.Since(streamStarted).Milliseconds())
+			p.signalMicStop(streamID)
+			p.writeError(err.kind, err.err, streamID)
 			if p.opts.errListener != nil {
 				p.opts.errListener.OnError(err.err)
 			}
@@ -314,13 +368,14 @@ procloop:
 				log.Println("Error closing context:")
 			}
 			strm = nil
+			p.signalStreamClosed(streamID)
 
 		case open := <-cloudChans.open:
-			if open.recvr.stream != strm {
+			if !isCurrentStream(open.recvr, strm, streamID) {
 				log.Println("Ignoring stream open from prior stream:", open.session)
 				continue
 			}
-			p.writeResponse(cloud.NewMessageWithStreamOpen(&cloud.StreamOpen{Session: open.session}))
+			p.writeResponse(cloud.NewMessageWithStreamOpen(&cloud.StreamOpen{Session: open.session, StreamId: streamID}))
 
 		case err := <-connCheck.err:
 			if err.recvr.stream != strm {
@@ -351,6 +406,12 @@ procloop:
 
 		case <-ctx.Done():
 			logVerbose("Received stop notification")
+			p.beginAudioOwner(0)
+			if strm != nil {
+				strm.Close()
+				p.signalMicStop(streamID)
+				p.signalStreamClosed(streamID)
+			}
 			if p.kill != nil {
 				close(p.kill)
 			}
@@ -399,13 +460,21 @@ func (p *Process) newStream(ctx context.Context, receiver *strmReceiver, strmopt
 	return stream
 }
 
-func (p *Process) writeError(reason cloud.ErrorType, err error) {
-	p.writeResponse(cloud.NewMessageWithError(&cloud.IntentError{Error: reason, Extra: err.Error()}))
+func isCurrentStream(receiver *strmReceiver, current *stream.Streamer, streamID uint32) bool {
+	return current != nil && receiver != nil && receiver.stream == current && receiver.streamID == streamID
+}
+
+func (p *Process) writeError(reason cloud.ErrorType, err error, streamID uint32) {
+	p.writeResponse(cloud.NewMessageWithError(&cloud.IntentError{Error: reason, Extra: err.Error(), StreamId: streamID}))
 }
 
 func (p *Process) writeResponse(response *cloud.Message) {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
+	p.writeResponseLocked(response)
+}
+
+func (p *Process) writeResponseLocked(response *cloud.Message) {
 	for _, r := range p.intents {
 		err := r.Send(response)
 		if err != nil {
@@ -414,8 +483,12 @@ func (p *Process) writeResponse(response *cloud.Message) {
 	}
 }
 
-func (p *Process) signalMicStop() {
-	p.writeMic(cloud.NewMessageWithStopSignal(&cloud.Void{}))
+func (p *Process) signalMicStop(streamID uint32) {
+	p.writeMic(cloud.NewMessageWithStopSignal(&cloud.StreamIdentifier{StreamId: streamID}))
+}
+
+func (p *Process) signalStreamClosed(streamID uint32) {
+	p.writeResponse(cloud.NewMessageWithStreamClosed(&cloud.StreamIdentifier{StreamId: streamID}))
 }
 
 func (p *Process) writeMic(msg *cloud.Message) {

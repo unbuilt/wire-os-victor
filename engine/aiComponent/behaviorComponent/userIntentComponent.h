@@ -50,6 +50,7 @@ class CozmoContext;
 class Robot;
 class UnitTestKey;
 class UserIntent;
+class ConversationSessionComponent;
 class UserIntentMap;
 enum class AnimationTrigger : int32_t;
 
@@ -97,6 +98,22 @@ public:
   // 
   ////////////////////////////////////////////////////////////////////////////////////////////////////////////
   void StartWakeWordlessStreaming( CloudMic::StreamType streamType, bool playGetInFromAnimProcess = false );
+  void AttachConversation(ConversationSessionComponent* session) { _conversation = session; }
+  void StartFollowUpStreaming(uint32_t streamId);
+  void StopConversationStream(uint32_t streamId, bool rejectResults = true);
+  bool IsCaptureQuiescent(uint32_t streamId) const {
+    return _captureStateKnown && _captureStreamId == streamId && !_captureOpen;
+  }
+  bool IsCaptureOpen(uint32_t streamId) const {
+    return _captureStateKnown && _captureStreamId == streamId && _captureOpen;
+  }
+  uint32_t GetCurrentStreamId() const { return _expectedStreamId; }
+  uint32_t AllocateStreamId() {
+    _nextStreamId = (_nextStreamId + 1) & 0x7fffffffu;
+    if (_nextStreamId == 0) { ++_nextStreamId; }
+    return _nextStreamId;
+  }
+  bool IsMicMuted() const { return _micMuted; }
   
   // Define how the user intent component should respond to the trigger word being detected
   void DisableEngineResponseToTriggerWord(const std::string& disablerName, bool disable);
@@ -157,7 +174,7 @@ public:
   // with no trigger word response, until a couple ticks after mute ends. In this case, wait longer
   // before the pending trigger expires and ignore any previous calls to DisableEngineResponseToTriggerWord().
   // TODO (VIC-11795): no muteEdgeCase param
-  void SetTriggerWordPending(const bool willOpenStream, const bool muteEdgeCase = false);
+  void SetTriggerWordPending(const bool willOpenStream, const bool muteEdgeCase = false, uint32_t streamId = 0);
 
   ////////////////////////////////////////////////////////////////////////////////////////////////////////////
   // User Intent:
@@ -313,6 +330,7 @@ public:
                          size_t minBytes = 0);
   // true if the stream for responseId reported an error (behavior should fall back to local TTS)
   bool HasCloudAudioError(const std::string& responseId);
+  bool HasCloudAudioInterruption(const std::string& responseId);
   // true if any ResponseAudioStart for responseId has been seen (audio is expected to be on its way)
   bool HasCloudAudioStarted(const std::string& responseId);
   // true once vic-cloud has signalled that no further audio is coming for responseId
@@ -326,7 +344,7 @@ public:
   // overwrite it. Pass an empty string to accept any response id again.
   void SetExpectedCloudAudioResponse(const std::string& responseId);
   // discard any buffered cloud audio (call on interruption / behavior deactivation)
-  void ClearCloudAudio();
+  void ClearCloudAudio(const std::string& responseId = "");
 
 private:
   
@@ -406,6 +424,17 @@ private:
   
   std::mutex _mutex;
   CloudMic::Message _pendingCloudIntent; // only pending for as long as it takes this thread to obtain a lock
+  std::list<CloudMic::Message> _cloudEvents;
+  ConversationSessionComponent* _conversation = nullptr;
+  uint32_t _expectedStreamId = 0;
+  bool _acceptStreamResults = true;
+  bool _streamResultReceived = false;
+  uint32_t _captureStreamId = 0;
+  bool _captureStateKnown = false;
+  bool _captureOpen = false;
+  bool _micMuted = false;
+  uint32_t _nextStreamId = 0;
+  bool _automaticListening = false;
   std::unique_ptr<BehaviorComponentCloudServer> _server;
 
   // Buffered cloud response audio (guarded by _mutex). See the Cloud response audio section above.
@@ -414,6 +443,7 @@ private:
     bool        haveStart    = false;
     bool        complete     = false;
     bool        hasError     = false;
+    bool        interrupted  = false;
     uint32_t    sampleRateHz = 0;
     uint8_t     channels     = 0;
     uint32_t    nextSequence = 0;

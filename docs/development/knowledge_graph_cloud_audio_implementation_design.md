@@ -1115,3 +1115,75 @@ Streaming playback is complete when:
 - Keep local TTS as deterministic fallback.
 - Correlate every asynchronous operation with `responseId` and generation.
 - Treat cloud audio as output only; it does not itself provide full duplex.
+
+## 28. Implemented low-latency interruption handling
+
+Lycopod defaults `knowledge.cloud_audio_first_sentence` to **true** and publishes
+the first sentence/audio handle before `tts.stop`. Explicit `false` still buffers
+the entire answer, trading latency for suppression of all audio on a later abort.
+Already played audio cannot be retracted in first-sentence mode.
+
+The previous raw HTTP path collapsed late upstream failures into a Provider
+error in `cloud/internal/voice/cloudaudio.go`. UIC retained only an error boolean,
+and KG could repeat early partial speech via local TTS or drain a longer failed
+answer through renderer completion. Aborted published handles were also deleted
+before a delayed fetch could learn their outcome. The changes below preserve
+the outcome through each of those boundaries rather than treating failure as EOS.
+
+For handle-based GET requests, `vic-cloud` now negotiates
+`Accept: application/vnd.lycopod.answer-audio.v1`. A matching Content-Type enables
+framing: one-byte kind, four-byte big-endian payload length, payload. PCM kind 0
+has 1–1024 bytes; terminal kinds have no payload: 1 successful END, 2 upstream
+abort, 3 upstream connection loss/timeout, 4 producer failure. No new CLAD fields
+or enum values are needed: existing `ResponseAudioErrorType::Cancelled` and
+`Transport` convey the two interrupted outcomes with stream/response ownership.
+
+HTTP 200 cannot change after publication and is not an answer outcome. Framed
+EOF without END, a truncated frame, or incomplete HTTP transfer is a transport
+failure; no padding, successful `ResponseAudioEnd`, or renderer completion is
+fabricated. Partial legacy raw-body failure is also Transport, but cannot tell
+explicit abort from connection loss. Generic text-to-TTS POSTs and old raw
+servers remain supported. Authentication/status/connection-establishment errors
+before an audio response, malformed audio and ordinary provider failures retain
+normal fallback policy rather than being globally silenced.
+
+Before publication, lycopod's typed upstream cancellation remains empty KG or
+terminal `intent_system_noaudio` in initial IntentGraph fallback. After
+publication it clears retained PCM but preserves the cancelled record until
+consumption/eviction, so a delayed HTTP fetch does not get a misleading 404.
+Negotiated interrupted records work even before any PCM reaches the robot.
+
+UIC preserves the typed interruption, rejects readiness, clears pending PCM and
+does not mark completion. KG observes it in searching, at playback admission and
+during streaming: cancel the renderer, clear queues, mark the conversation
+unsuccessful, exit quietly without a failure animation, local TTS or automatic
+follow-up. This policy also covers an established producer's readiness deadline
+or playback stall, but not a fetch that never established an audio response.
+It is independent of follow-up being enabled and of the one-turn limit.
+Other failures never drain partial audio as if successful; the old
+meaningful-playback threshold is retained only for ordinary local-TTS fallback.
+
+Migration requires updated lycopod and **both vic-cloud and vic-engine**.
+Install via the project's consistent full OTA workflow after review; no
+packaging, robot installation or service restart is performed by this change.
+Existing raw clients do not gain typed post-header cancellation by updating
+lycopod alone. Existing `cloud_audio: false` SDK behavior is unchanged.
+
+Validation for this change: 155 targeted lycopod tests (including real KG and
+IntentGraph RPC early return followed by streamed abort/connection loss, real
+WebSocket truncation, buffered mode, and disabled cloud audio); 24 Go voice tests
+plus 27 subtests and three KG/follow-up adapter tests under `-race`; 41 native
+production-routing/session/playback tests under ASan/UBSan. The native harness
+executes the real UIC and KG searching/admission/streaming/cancellation functions,
+including interruption before playback, before/after the old salvage threshold,
+follow-up disabled and one-turn policy, and established versus unopened readiness
+timeouts.
+
+Both actual ARM `vic-engine` (including `libcozmo_engine.so`) and `vic-cloud`
+built in the existing offline Yocto builder. Evidence and artifact hashes are
+under `anki/victor/_build/interruption-validation/`, with native results under
+`anki/victor/_build/kg-followup/`. The initial host build lacked the cross
+compiler; the container build required the existing writable caches and explicit
+release/tool definitions (this project's CMake clears stale command-line
+definitions on regeneration). Final incremental ARM build succeeded. No version
+bump, packaging, installation or hardware/acoustic validation was performed.

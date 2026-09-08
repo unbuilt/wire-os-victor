@@ -32,7 +32,12 @@ enum uint_8 ConnectionCode {
 }
 
 structure StreamOpen {
-	string session
+	string session,
+	uint_32 streamId = 0
+}
+
+structure StreamIdentifier {
+	uint_32 streamId = 0
 }
 
 structure Hotword {
@@ -40,6 +45,7 @@ structure Hotword {
 	string locale,
 	string timezone,
 	bool noLogging,
+	uint_32 streamId = 0
 }
 
 structure Filename {
@@ -47,7 +53,8 @@ structure Filename {
 }
 
 structure AudioData {
-	int_16 data[uint_16]
+	int_16 data[uint_16],
+	uint_32 streamId = 0
 }
 
 // Response-audio lifecycle (cloud -> engine). Used to stream cloud-generated
@@ -73,7 +80,8 @@ structure ResponseAudioStart {
 	uint_32 sampleRateHz,
 	uint_8 channels,
 	uint_32 totalFrames,
-	bool totalFramesKnown
+	bool totalFramesKnown,
+	uint_32 streamId = 0
 }
 
 // data payload must be capped at 1024 bytes by the sender so the packed
@@ -81,29 +89,34 @@ structure ResponseAudioStart {
 structure ResponseAudioChunk {
 	string responseId,
 	uint_32 sequenceNumber,
-	uint_8 data[uint_16]
+	uint_8 data[uint_16],
+	uint_32 streamId = 0
 }
 
 structure ResponseAudioEnd {
 	string responseId,
-	uint_32 finalSequenceNumber
+	uint_32 finalSequenceNumber,
+	uint_32 streamId = 0
 }
 
 structure ResponseAudioError {
 	string responseId,
 	ResponseAudioErrorType error,
-	string details
+	string details,
+	uint_32 streamId = 0
 }
 
 structure IntentResult {
 	string intent,
 	string[uint_16] parameters,
-	string[uint_16] metadata
+	string[uint_16] metadata,
+	uint_32 streamId = 0
 }
 
 structure IntentError {
 	ErrorType error,
-	string extra
+	string extra,
+	uint_32 streamId = 0
 }
 
 structure ConnectionResult {
@@ -117,11 +130,11 @@ union dupes_allowed Message {
 	// anim -> cloud
 	Hotword hotword,
 	AudioData audio,
-	Void audioDone,
+	StreamIdentifier audioDone,
 	Void connectionCheck,
 
 	// cloud -> anim
-	Void stopSignal,
+	StreamIdentifier stopSignal,
 	Void testStarted,
 	Void streamTimeout,
 	ConnectionResult connectionResult,
@@ -136,7 +149,11 @@ union dupes_allowed Message {
 	ResponseAudioStart responseAudioStart,
 	ResponseAudioChunk responseAudioChunk,
 	ResponseAudioEnd responseAudioEnd,
-	ResponseAudioError responseAudioError
+	ResponseAudioError responseAudioError,
+
+	// Correlated capture cancellation and cloud-worker completion.
+	StreamIdentifier cancelStream,
+	StreamIdentifier streamClosed
 }
 
 

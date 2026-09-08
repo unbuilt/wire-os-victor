@@ -224,6 +224,7 @@ enum uint_8 BehaviorClass {
 
   // robotDrivenDialog
   PromptUserForVoiceCommand,
+  ConversationFollowUp,
 
   // sdkBehaviors
   SDKInterface,

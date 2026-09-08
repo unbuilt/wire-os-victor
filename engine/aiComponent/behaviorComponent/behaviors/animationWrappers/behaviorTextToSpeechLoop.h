@@ -27,6 +27,8 @@ enum class UtteranceState;
 class BehaviorTextToSpeechLoop : public ICozmoBehavior
 {
 public:
+  enum class PlaybackOutcome { Succeeded, Failed, Cancelled };
+  PlaybackOutcome GetPlaybackOutcome() const { return _playbackOutcome; }
   using AudioTtsProcessingStyle = AudioMetaData::SwitchState::Robot_Vic_External_Processing;
   
   virtual ~BehaviorTextToSpeechLoop();
@@ -66,6 +68,8 @@ protected:
   virtual void OnBehaviorDeactivated() override final;
 
 private:
+  PlaybackOutcome _playbackOutcome = PlaybackOutcome::Cancelled;
+  uint64_t _utteranceGeneration = 0;
 
   enum class State{
     IdleLoop,

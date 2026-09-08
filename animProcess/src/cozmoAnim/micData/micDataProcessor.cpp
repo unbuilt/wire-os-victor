@@ -14,6 +14,8 @@
 
 // Signal Essence Includes
 #include "mmif.h"
+#include "aecExperiment.h"
+#include "audioEngine/plugins/aecPlaybackReference.h"
 #include "policy_actions.h"
 #include "se_diag.h"
 
@@ -114,7 +116,14 @@ MicDataProcessor::MicDataProcessor(const Anim::AnimContext* context, MicDataSyst
 , _beatDetector(std::make_unique<BeatDetector>())
 {
   // Init the various SE processing
+  _aecExperimentMode = AnkiAecExperimentMode();
+  if (_aecExperimentMode) {
+    _aecMicAgeMs = AnkiAecExperimentMicAgeMs();
+    _aecRefDelayMs = AnkiAecExperimentDelayMs();
+    AudioEngine::PlugIns::GetAecPlaybackReference().Enable();
+  }
   MMIfInit(0, nullptr);
+  AnkiAecExperimentStart();
   InitVAD();
 
   // Cache off the indices of the SE processing variables we will be accessing
@@ -196,12 +205,15 @@ void MicDataProcessor::TriggerWordDetectCallback(TriggerWordDetectSource source,
   // should be based on the engine-requested state at the time of the trigger word callback. Ugh.
   // Anyway, we should cache shouldStream and use it in earConCallback
   bool shouldStream = showStreamState->ShouldStreamAfterTriggerWordResponse();
+  // Wake-triggered IDs occupy the upper half, engine-requested IDs the lower
+  // half. Identity does not change ordinary capture overlap.
+  const uint32_t streamId = 0x80000000u | (++_wakeStreamCounter & 0x7fffffffu);
   
   // Start command stream after EarCon completes
-  auto earConCallback = [this,shouldStream](bool success) {
+  auto earConCallback = [this,shouldStream,streamId](bool success) {
     // If we didn't succeed, it means that we didn't have a wake word response setup
     if (success) {
-      RobotTimeStamp_t mostRecentTimestamp = CreateTriggerWordDetectedJobs(shouldStream);
+      RobotTimeStamp_t mostRecentTimestamp = CreateTriggerWordDetectedJobs(shouldStream, streamId);
       LOG_INFO("MicDataProcessor.TWCallback", "Timestamp %d", (TimeStamp_t)mostRecentTimestamp);
     }
     else {
@@ -227,6 +239,7 @@ void MicDataProcessor::TriggerWordDetectCallback(TriggerWordDetectSource source,
 
   // Set up a message to send out about the triggerword
   RobotInterface::TriggerWordDetected twDetectedMessage;
+  twDetectedMessage.streamId = streamId;
   twDetectedMessage.direction = currentDirection;
   twDetectedMessage.isButtonPress = buttonPress;
   twDetectedMessage.fromMute = muteButton;
@@ -251,7 +264,7 @@ void MicDataProcessor::TriggerWordDetectCallback(TriggerWordDetectSource source,
 }
   
 RobotTimeStamp_t MicDataProcessor::CreateStreamJob(CloudMic::StreamType streamType,
-                                                  uint32_t overlapLength_ms)
+                                                  uint32_t overlapLength_ms, uint32_t streamId, bool freshCapture)
 {
   // Setup Job
   auto newJob = std::make_shared<MicDataInfo>();
@@ -259,6 +272,16 @@ RobotTimeStamp_t MicDataProcessor::CreateStreamJob(CloudMic::StreamType streamTy
   newJob->_writeNameBase = ""; //use autogen names
   newJob->_numMaxFiles = 100;
   newJob->_type = streamType;
+  newJob->_streamId = streamId;
+  if (freshCapture) {
+    // Exclude both queued processing stages and the first arriving block, which
+    // can straddle the end of the earcon/settle interval.
+    std::lock_guard<std::mutex> lock(_rawMicDataMutex);
+    newJob->_minimumCaptureSequence = _captureSequence + 2;
+    newJob->_minimumCaptureTime_ns = AudioEngine::PlugIns::AecPlaybackReference::NowNs() +
+      static_cast<int64_t>(kTimePerChunk_ms) * 1000000;
+    overlapLength_ms = 0;
+  }
   bool saveToFile = false;
 #if ANKI_DEV_CHEATS
   saveToFile = true;
@@ -313,17 +336,18 @@ RobotTimeStamp_t MicDataProcessor::CreateStreamJob(CloudMic::StreamType streamTy
   const bool isStreamingJob = true;
   _micDataSystem->AddMicDataJob(newJob, isStreamingJob);
   
-  RobotTimeStamp_t mostRecentTimestamp = _immediateAudioBuffer[_procAudioRawComplete-1].timestamp;
+  RobotTimeStamp_t mostRecentTimestamp = _procAudioRawComplete > 0
+    ? _immediateAudioBuffer[_procAudioRawComplete-1].timestamp : 0;
   return mostRecentTimestamp;
 }
 
-RobotTimeStamp_t MicDataProcessor::CreateTriggerWordDetectedJobs(bool shouldStream)
+RobotTimeStamp_t MicDataProcessor::CreateTriggerWordDetectedJobs(bool shouldStream, uint32_t streamId)
 {
   RobotTimeStamp_t mostRecentTimestamp = 0;
   if (shouldStream)
   {
     // First we create the job responsible for streaming the intent after the trigger
-    mostRecentTimestamp = CreateStreamJob(CloudMic::StreamType::Normal, kTriggerOverlapSize_ms);
+    mostRecentTimestamp = CreateStreamJob(CloudMic::StreamType::Normal, kTriggerOverlapSize_ms, streamId);
   } else {
     LOG_INFO("MicDataProcessor.CreateTriggerWordDetectedJobs.NoStreaming", "Not adding streaming jobs because disabled");
   }
@@ -384,7 +408,8 @@ MicDataProcessor::~MicDataProcessor()
 void MicDataProcessor::ProcessRawAudio(RobotTimeStamp_t timestamp,
                                        const AudioUtil::AudioSample* audioChunk,
                                        uint32_t robotStatus,
-                                       float robotAngle)
+                                       float robotAngle,
+                                       uint64_t captureSequence, int64_t captureTime_ns)
 {
   ANKI_CPU_PROFILE("MicDataProcessor::ProcessRawAudio");
   TimedMicData* nextSampleSpot = nullptr;
@@ -413,6 +438,8 @@ void MicDataProcessor::ProcessRawAudio(RobotTimeStamp_t timestamp,
 
   TimedMicData& nextSample = *nextSampleSpot;
   nextSample.timestamp = timestamp;
+  nextSample.captureSequence = captureSequence;
+  nextSample.captureTime_ns = captureTime_ns;
   MicDirectionData directionResult = ProcessMicrophonesSE(
     audioChunk,
     nextSample.audioBlock.data(),
@@ -593,6 +620,12 @@ MicDirectionData MicDataProcessor::ProcessMicrophonesSE(const AudioUtil::AudioSa
   
 #endif
   
+  // Keep the baseline and enabled experiment on exactly the same SE path, even on
+  // the charger. This does not change VAD/streaming/wake-word or conversation policy.
+  if (_aecExperimentMode) {
+    processingState = ProcessingState::SigEsBeamformingOff;
+  }
+
   // Update State
   SetActiveMicDataProcessingState(processingState);
   bool directionIsAvailable = false;
@@ -629,13 +662,101 @@ MicDirectionData MicDataProcessor::ProcessMicrophonesSE(const AudioUtil::AudioSa
     case ProcessingState::SigEsBeamformingOn:
     {
       // Signal Essense Processing
-      static const std::array<
+      std::array<
           AudioUtil::AudioSample, 
-          kSamplesPerBlockPerChannel * kNumInputChannels> dummySpeakerOut{};
+          kSamplesPerBlockPerChannel * kNumInputChannels> speakerReference{};
+      auto& reference = AudioEngine::PlugIns::GetAecPlaybackReference();
+      size_t missing = 0;
+      int64_t processStart = 0;
+      int64_t cpuStart = -1;
+      if (_aecExperimentMode) {
+        const auto startNs = _aecMicReceivedNs -
+          static_cast<int64_t>(_aecMicAgeMs + _aecRefDelayMs) * 1000000;
+        missing = reference.ReadMicrophone(speakerReference.data(), kSamplesPerBlockPerChannel, startNs,
+                                          _aecTimingSnapshot.sampleNs);
+        for (size_t i = 0; i < kSamplesPerBlockPerChannel; ++i) {
+          const int64_t value = speakerReference[i];
+          _aecReferenceEnergy += value * value;
+        }
+        // A gap also invalidates the vendor's prior reference/filter history.
+        const bool timingValid = _aecMicClockReady && !_aecMicClockFault &&
+          reference.ClockReady() && !reference.ClockFault() &&
+          !_aecInputOverflows.load() && !reference.Dropped() &&
+          !reference.Errors() && !reference.Discontinuities();
+        _aecTimingInvalidBlocks += !timingValid;
+        AnkiAecExperimentPrepareBlock(missing == 0 && timingValid);
+        processStart = reference.NowNs();
+        cpuStart = AudioEngine::PlugIns::AecExecutionTiming::ThreadCpuNs();
+      }
       {
         ANKI_CPU_PROFILE("ProcessMicrophonesSE");
         // Process the current audio block with SE software
-        MMIfProcessMicrophones(dummySpeakerOut.data(), audioChunk, bufferOut);
+        MMIfProcessMicrophones(speakerReference.data(), audioChunk, bufferOut);
+      }
+      if (_aecExperimentMode) {
+        const auto cpuEnd = AudioEngine::PlugIns::AecExecutionTiming::ThreadCpuNs();
+        AnkiAecExperimentCompleteBlock();
+        _aecExecutionTiming.Add(reference.NowNs() - processStart, cpuStart, cpuEnd);
+        _aecMissing += missing;
+        _aecValidBlocks += (missing == 0);
+        if (++_aecBlocks == 500) {
+          unsigned adaptedMics = 0;
+          const auto taps = MMIfGetAecLenChanModel();
+          for (unsigned mic = 0; mic < kNumInputChannels; ++mic) {
+            const auto* coefficients = MMIfGetAecChanModelCoef(mic);
+            for (unsigned tap = 0; tap < taps; ++tap) {
+              if (coefficients[tap] != 0) {
+                ++adaptedMics;
+                break;
+              }
+            }
+          }
+          LOG_INFO("AEC_EXPERIMENT.Stats",
+                   "mode=%d blocks=%u valid=%u missing_samples=%u dropped=%u sink_errors=%u input_overflows=%u ref_discontinuities=%u timing_invalid=%u mic_clock_fault=%u ref_clock_fault=%u mic_residual_us=%d mic_drift_us=%d ref_residual_us=%d ref_drift_us=%d max_queue_us=%u max_se_wall_us=%u max_se_cpu_us=%u max_se_non_cpu_us=%u mean_se_wall_us=%u mean_se_cpu_us=%u se_wall_over_budget=%u se_cpu_over_budget=%u cpu_clock_errors=%u last_bypass=%u last_update_bypass=%d history_remaining=%d adapted_mics=%u ref_mean_square=%.1f",
+                   _aecExperimentMode, _aecBlocks, _aecValidBlocks, _aecMissing,
+                   reference.Dropped(), reference.Errors(), _aecInputOverflows.load(), reference.Discontinuities(),
+                   _aecTimingInvalidBlocks, unsigned(_aecMicClockFault), unsigned(reference.ClockFault()),
+                   _aecMicResidualUs, _aecMicDriftUs, reference.ClockResidualUs(), reference.ClockDriftUs(),
+                   _aecMaxQueueUs, _aecExecutionTiming.maxWallUs, _aecExecutionTiming.maxCpuUs,
+                   _aecExecutionTiming.maxNonCpuUs,
+                   static_cast<uint32_t>(_aecExecutionTiming.totalWallUs / _aecBlocks),
+                   static_cast<uint32_t>(_aecExecutionTiming.totalCpuUs / _aecBlocks),
+                   _aecExecutionTiming.wallOverBudget, _aecExecutionTiming.cpuOverBudget,
+                   _aecExecutionTiming.errors, MMIfGetAecBypass(),
+                   AnkiAecExperimentGetUpdateBypass(), AnkiAecExperimentHistoryBlocksRemaining(), adaptedMics,
+                   static_cast<double>(_aecReferenceEnergy) / (_aecBlocks * kSamplesPerBlockPerChannel));
+          LOG_INFO("AEC_EXPERIMENT.Clock",
+                   "mic_windows=%u mic_rate_ppb=%d mic_fit_error_us=%d mic_raw_residual_us=%d mic_window_min_us=%d mic_window_max_us=%d source_errors=%u source_first=%u source_last=%u source_received_ns=%llu transport_us=%u ref_windows=%u ref_rate_ppb=%d ref_fit_error_us=%d ref_raw_residual_us=%d ref_window_min_us=%d ref_window_max_us=%d",
+                   _aecTimingSnapshot.windows, _aecTimingSnapshot.ratePpb, _aecTimingSnapshot.fitErrorUs,
+                   _aecTimingSnapshot.rawResidualUs, _aecTimingSnapshot.windowMinUs, _aecTimingSnapshot.windowMaxUs,
+                   _aecTimingSnapshot.sourceErrors, _aecTimingSnapshot.payload.sourceFirstFrame,
+                   _aecTimingSnapshot.payload.sourceLastFrame,
+                   static_cast<unsigned long long>(_aecTimingSnapshot.payload.sourceReceivedNs),
+                   _aecTimingSnapshot.transportUs, reference.ClockWindows(), reference.ClockRatePpb(),
+                   reference.ClockFitErrorUs(), reference.ClockRawResidualUs(),
+                   reference.ClockWindowMinUs(), reference.ClockWindowMaxUs());
+          // Acquire before loading the immutable fault fields: C++14 does not
+          // specify the evaluation order of logging arguments.
+          const auto refFaultReason = reference.ClockFaultReason();
+          LOG_INFO("AEC_EXPERIMENT.Tracking",
+                   "revision=109 mic_updates=%u ref_updates=%u mic_fault_reason=%u mic_fault_elapsed_ms=%u mic_fault_offset_us=%d mic_fault_min_us=%d mic_fault_observed_ns=%llu mic_fault_predicted_ns=%llu source_fault_reason=%u source_expected=%u source_fault_first=%u source_fault_last=%u ref_fault_reason=%u ref_fault_elapsed_ms=%u ref_fault_offset_us=%d ref_fault_min_us=%d",
+                   _aecTimingSnapshot.updates, reference.ClockUpdates(), _aecTimingSnapshot.faultReason,
+                   _aecTimingSnapshot.faultElapsedMs, _aecTimingSnapshot.faultOffsetUs,
+                   _aecTimingSnapshot.faultWindowMinUs,
+                   static_cast<unsigned long long>(_aecTimingSnapshot.faultObservedNs),
+                   static_cast<unsigned long long>(_aecTimingSnapshot.faultPredictedNs),
+                   _aecTimingSnapshot.sourceFaultReason, _aecTimingSnapshot.sourceExpected,
+                   _aecTimingSnapshot.sourceFaultFirst, _aecTimingSnapshot.sourceFaultLast,
+                   refFaultReason, refFaultReason ? reference.ClockFaultElapsedMs() : 0,
+                   refFaultReason ? reference.ClockFaultOffsetUs() : 0,
+                   refFaultReason ? reference.ClockFaultWindowMinUs() : 0);
+          if (_aecValidBlocks != _aecBlocks || _aecTimingInvalidBlocks || _aecExecutionTiming.errors) {
+            LOG_WARNING("AEC_EXPERIMENT.ReferenceInvalid", "Do not interpret this capture as a valid AEC comparison");
+          }
+          _aecBlocks = _aecMissing = _aecValidBlocks = _aecMaxQueueUs = _aecTimingInvalidBlocks = 0;
+          _aecExecutionTiming = {};
+          _aecReferenceEnergy = 0;
+        }
       }
       directionIsAvailable = true;
       break;
@@ -709,7 +830,19 @@ void MicDataProcessor::ProcessRawLoop()
     {
       ANKI_CPU_PROFILE("ProcessLoop");
 
-      const auto& nextData = rawAudioToProcess.front();
+      const auto& received = rawAudioToProcess.front();
+      const auto& nextData = received.payload;
+      _aecMicReceivedNs = received.receivedNs;
+      if (_aecExperimentMode) {
+        _aecTimingSnapshot = received;
+        _aecMicClockReady = received.clockReady;
+        _aecMicClockFault = received.clockFault;
+        _aecMicResidualUs = received.residualUs;
+        _aecMicDriftUs = received.driftUs;
+        const auto queueNs = AudioEngine::PlugIns::AecPlaybackReference::NowNs() - received.arrivalNs;
+        _aecMaxQueueUs = std::max(_aecMaxQueueUs,
+          static_cast<uint32_t>(std::max<int64_t>(0, queueNs) / 1000));
+      }
       const auto* audioChunk = nextData.data;
       
       // Copy the current set of jobs we have for recording audio, so the list can be added to while processing
@@ -718,7 +851,8 @@ void MicDataProcessor::ProcessRawLoop()
       // Collect the raw audio if desired
       for (auto& job : jobs)
       {
-        job->CollectRawAudio(audioChunk, kIncomingAudioChunkSize);
+        job->CollectRawAudio(audioChunk, kIncomingAudioChunkSize,
+                             received.captureSequence, received.captureTime_ns);
       }
 
       _speechRecognizerSystem->UpdateNotch(audioChunk, kIncomingAudioChunkSize);
@@ -731,7 +865,7 @@ void MicDataProcessor::ProcessRawLoop()
           nextData.timestamp,
           audioChunk,
           nextData.robotStatusFlags,
-          nextData.robotRotationAngle);
+          nextData.robotRotationAngle, received.captureSequence, received.captureTime_ns);
       }
       
       _micDataSystem->UpdateMicJobs();
@@ -789,7 +923,8 @@ void MicDataProcessor::ProcessTriggerLoop()
     std::deque<std::shared_ptr<MicDataInfo>> jobs = _micDataSystem->GetMicDataJobs();
     for (auto& job : jobs)
     {
-      job->CollectProcessedAudio(processedAudio.data(), processedAudio.size());
+      job->CollectProcessedAudio(processedAudio.data(), processedAudio.size(),
+                                 readyDataSpot->captureSequence, readyDataSpot->captureTime_ns);
     }
     
     // Run the trigger detection, which will use the callback defined above
@@ -840,8 +975,59 @@ void MicDataProcessor::ProcessMicDataPayload(const RobotInterface::MicData& payl
   if (!_muteMics) {
     // Use whichever buffer is currently _not_ being processed
     auto& bufferToUse = (_rawAudioProcessingIndex == 1) ? _rawAudioBuffers[0] : _rawAudioBuffers[1];
-    RobotInterface::MicData& nextJob = bufferToUse.push_back();
-    nextJob = payload;
+    if (_aecExperimentMode && bufferToUse.size() == bufferToUse.capacity()) {
+      ++_aecInputOverflows;
+      AudioEngine::PlugIns::GetAecPlaybackReference().Diagnostic().NoteError(
+        AudioEngine::PlugIns::AecDiagnosticCapture::MicQueueOverflow);
+    }
+    auto& nextJob = bufferToUse.push_back();
+    nextJob.payload = payload;
+    nextJob.captureSequence = ++_captureSequence;
+    const auto captureReceivedNs = AudioEngine::PlugIns::AecPlaybackReference::NowNs();
+    // Source timestamps also exclude mic datagrams queued upstream of anim.
+    nextJob.captureTime_ns = payload.sourceReceivedNs != 0 &&
+                            payload.sourceReceivedNs <= static_cast<uint64_t>(captureReceivedNs)
+      ? static_cast<int64_t>(payload.sourceReceivedNs) : captureReceivedNs;
+    if (_aecExperimentMode) {
+      const auto nowNs = AudioEngine::PlugIns::AecPlaybackReference::NowNs();
+      nextJob.arrivalNs = nowNs;
+      if (!_aecSourceContinuity.Observe(payload.sourceFirstFrame, payload.sourceLastFrame,
+                                       payload.sourceTimingValid) ||
+          payload.sourceReceivedNs == 0 || payload.sourceReceivedNs > static_cast<uint64_t>(nowNs)) {
+        _aecCaptureClock.Invalidate(static_cast<int64_t>(payload.sourceReceivedNs));
+      }
+      nextJob.receivedNs = _aecCaptureClock.Observe(
+        static_cast<int64_t>(payload.sourceReceivedNs), AudioEngine::PlugIns::kAecMicBlockNs, 100000000);
+      AudioEngine::PlugIns::GetAecPlaybackReference().Diagnostic().Microphone(
+        payload.data, _aecDiagnosticRawIndex, nowNs, payload.sourceFirstFrame,
+        payload.sourceLastFrame, payload.sourceTimingValid, _aecCaptureClock);
+      _aecDiagnosticRawIndex += kSamplesPerBlockPerChannel;
+      nextJob.clockReady = _aecCaptureClock.Ready();
+      nextJob.clockFault = _aecCaptureClock.Fault();
+      nextJob.residualUs = static_cast<int32_t>(_aecCaptureClock.ResidualNs() / 1000);
+      nextJob.driftUs = static_cast<int32_t>(_aecCaptureClock.DriftNs() / 1000);
+      nextJob.sampleNs = AudioEngine::PlugIns::kAecMicSampleNs * _aecCaptureClock.Scale();
+      nextJob.ratePpb = _aecCaptureClock.RatePpb();
+      nextJob.fitErrorUs = static_cast<int32_t>(_aecCaptureClock.FitErrorNs() / 1000);
+      nextJob.rawResidualUs = static_cast<int32_t>(_aecCaptureClock.RawResidualNs() / 1000);
+      nextJob.windowMinUs = static_cast<int32_t>(_aecCaptureClock.WindowMinNs() / 1000);
+      nextJob.windowMaxUs = static_cast<int32_t>(_aecCaptureClock.WindowMaxNs() / 1000);
+      nextJob.windows = _aecCaptureClock.Windows();
+      nextJob.sourceErrors = _aecSourceContinuity.Errors();
+      nextJob.updates = _aecCaptureClock.Updates();
+      nextJob.faultReason = _aecCaptureClock.Reason();
+      nextJob.faultElapsedMs = static_cast<uint32_t>(_aecCaptureClock.FaultElapsedNs() / 1000000);
+      nextJob.faultObservedNs = _aecCaptureClock.FaultObservedNs();
+      nextJob.faultPredictedNs = _aecCaptureClock.FaultPredictedNs();
+      nextJob.faultOffsetUs = _aecCaptureClock.FaultOffsetUs();
+      nextJob.faultWindowMinUs = static_cast<int32_t>(_aecCaptureClock.FaultWindowMinNs() / 1000);
+      nextJob.sourceFaultReason = _aecSourceContinuity.Reason();
+      nextJob.sourceExpected = _aecSourceContinuity.Expected();
+      nextJob.sourceFaultFirst = _aecSourceContinuity.First();
+      nextJob.sourceFaultLast = _aecSourceContinuity.Last();
+      nextJob.transportUs = static_cast<uint32_t>(std::max<int64_t>(0,
+        nowNs - static_cast<int64_t>(payload.sourceReceivedNs)) / 1000);
+    }
   }
 }
   

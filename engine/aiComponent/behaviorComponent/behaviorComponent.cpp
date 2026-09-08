@@ -34,6 +34,7 @@
 #include "engine/aiComponent/behaviorComponent/sleepTracker.h"
 #include "engine/aiComponent/behaviorComponent/userDefinedBehaviorTreeComponent/userDefinedBehaviorTreeComponent.h"
 #include "engine/aiComponent/behaviorComponent/userIntentComponent.h"
+#include "engine/aiComponent/behaviorComponent/conversationSessionComponent.h"
 #include "engine/audio/engineRobotAudioClient.h"
 #include "engine/blockWorld/blockWorld.h"
 #include "engine/components/powerStateManager.h"
@@ -134,6 +135,11 @@ void BehaviorComponent::GenerateManagedComponents(Robot& robot,
   }
 
   // Behavior Container
+  if (!entity->HasComponent<ConversationSessionComponent>()) {
+    entity->AddDependentComponent(BCComponentID::ConversationSessionComponent,
+                                  new ConversationSessionComponent());
+  }
+
   if(!entity->HasComponent<BehaviorContainer>()){
     if(robot.GetContext() != nullptr){
       auto bcPtr = new BehaviorContainer(robot.GetContext()->GetDataLoader()->GetBehaviorJsons());

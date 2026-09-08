@@ -19,6 +19,12 @@
   "cloudAudioReadyTimeout"      : 20.0,
   "cloudAudioFallbackToLocalTts": true,
   "cloudAudioVolume"            : 100,
+  "multiTurnVoice": {
+    "enabled": true,
+    "maxTurns": 5,
+    "sessionTimeout_sec": 120,
+    "followUpSettleTime_ms": 250
+  },
 
   "postBehaviorSuggestion": "Socialize"
 }

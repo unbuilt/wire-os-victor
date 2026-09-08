@@ -22,6 +22,7 @@
 #include "clad/cloud/mic.h"
 #include "util/container/fixedCircularBuffer.h"
 #include "util/global/globalDefinitions.h"
+#include "audioEngine/plugins/aecExperimentTiming.h"
 
 #include <array>
 #include <atomic>
@@ -70,6 +71,9 @@ public:
   void Init();
 
   void ProcessMicDataPayload(const RobotInterface::MicData& payload);
+  int GetAecExperimentMode() const { return _aecExperimentMode; }
+  int GetAecMicAgeMs() const { return _aecMicAgeMs; }
+  int GetAecRefDelayMs() const { return _aecRefDelayMs; }
   void RecordRawAudio(uint32_t duration_ms, const std::string& path, bool runFFT);
 
   enum class ProcessingState {
@@ -90,7 +94,8 @@ public:
   // Create and start stream audio data job
   // Note: Overlap size is only as large as the audio buffer, see kTriggerAudioLengthShipping_ms
   RobotTimeStamp_t CreateStreamJob(CloudMic::StreamType streamType = CloudMic::StreamType::Normal,
-                                  uint32_t overlapLength_ms = 0);
+                                  uint32_t overlapLength_ms = 0, uint32_t streamId = 0,
+                                  bool freshCapture = false);
 
   void VoiceTriggerWordDetection(const AudioUtil::SpeechRecognizerCallbackInfo& info);
 
@@ -123,12 +128,51 @@ private:
   float _rawAudioBufferFullness[2] = { 0.f, 0.f };
   // We have 2 fixed buffers for incoming raw audio that we alternate between, so that the processing thread can work
   // on one set of data while the main thread can copy new data into the other set.
-  Util::FixedCircularBuffer<RobotInterface::MicData, kRawAudioBufferSize> _rawAudioBuffers[2];
+  struct ReceivedMicData {
+    RobotInterface::MicData payload;
+    uint64_t captureSequence = 0;
+    int64_t captureTime_ns = 0;
+    int64_t receivedNs = 0;
+    int64_t arrivalNs = 0;
+    int32_t residualUs = 0;
+    int32_t driftUs = 0;
+    double sampleNs = AudioEngine::PlugIns::kAecMicSampleNs;
+    int32_t ratePpb = 0, fitErrorUs = 0, rawResidualUs = 0;
+    int32_t windowMinUs = 0, windowMaxUs = 0;
+    uint32_t windows = 0, sourceErrors = 0, transportUs = 0;
+    uint32_t updates = 0, faultReason = 0, faultElapsedMs = 0;
+    int32_t faultOffsetUs = 0, faultWindowMinUs = 0;
+    uint32_t sourceFaultReason = 0, sourceExpected = 0, sourceFaultFirst = 0, sourceFaultLast = 0;
+    uint64_t faultObservedNs = 0, faultPredictedNs = 0;
+    bool clockReady = false;
+    bool clockFault = false;
+  };
+  Util::FixedCircularBuffer<ReceivedMicData, kRawAudioBufferSize> _rawAudioBuffers[2];
+  int _aecExperimentMode = 0;
+  int _aecMicAgeMs = 0;
+  int _aecRefDelayMs = 0;
+  int64_t _aecMicReceivedNs = 0;
+  AudioEngine::PlugIns::AecCalibratedClock _aecCaptureClock{true};
+  uint64_t _aecDiagnosticRawIndex = 0;
+  AudioEngine::PlugIns::AecSourceContinuity _aecSourceContinuity;
+  ReceivedMicData _aecTimingSnapshot;
+  std::atomic<uint32_t> _aecInputOverflows{0};
+  bool _aecMicClockReady = false;
+  bool _aecMicClockFault = false;
+  int32_t _aecMicResidualUs = 0, _aecMicDriftUs = 0;
+  uint32_t _aecMaxQueueUs = 0;
+  uint32_t _aecTimingInvalidBlocks = 0;
+  uint32_t _aecBlocks = 0;
+  uint32_t _aecMissing = 0;
+  uint32_t _aecValidBlocks = 0;
+  AudioEngine::PlugIns::AecExecutionTiming _aecExecutionTiming;
+  uint64_t _aecReferenceEnergy = 0;
   // Index of the buffer that is currently being used by the processing thread
   uint32_t _rawAudioProcessingIndex = 0;
   std::thread _processThread;
   std::thread _processTriggerThread;
   std::mutex _rawMicDataMutex;
+  uint64_t _captureSequence = 0;
   bool _muteMics = false;
   bool _processThreadStop = false;
   bool _robotWasMoving = false;
@@ -148,6 +192,8 @@ private:
   struct TimedMicData {
     std::array<AudioUtil::AudioSample, kSamplesPerBlockPerChannel> audioBlock;
     RobotTimeStamp_t timestamp;
+    uint64_t captureSequence = 0;
+    int64_t captureTime_ns = 0;
   };
   Util::FixedCircularBuffer<TimedMicData, kImmediateBufferSize> _immediateAudioBuffer;
 
@@ -181,12 +227,14 @@ private:
                                  const AudioUtil::SpeechRecognizerCallbackInfo& info);
   
   // Return 0 if the stream job can not be created
-  RobotTimeStamp_t CreateTriggerWordDetectedJobs(bool shouldStream);
+  RobotTimeStamp_t CreateTriggerWordDetectedJobs(bool shouldStream, uint32_t streamId);
+  std::atomic<uint32_t> _wakeStreamCounter{0};
   
   void ProcessRawAudio(RobotTimeStamp_t timestamp,
                        const AudioUtil::AudioSample* audioChunk,
                        uint32_t robotStatus,
-                       float robotAngle);
+                       float robotAngle,
+                       uint64_t captureSequence, int64_t captureTime_ns);
 
   MicDirectionData ProcessMicrophonesSE(const AudioUtil::AudioSample* audioChunk,
                                         AudioUtil::AudioSample* bufferOut,

@@ -1,4 +1,5 @@
 #include "AkAlsaSink.h"
+#include "audioEngine/plugins/aecPlaybackReference.h"
 #include "Logging.h"
 #include <alsa/pcm.h>
 
@@ -58,6 +59,8 @@ std::function<void(AkAlsaSink*)> AkAlsaSink::PostCreateAlsaFunc = nullptr;
 
 static int alsa_error_recovery(void *in_puserdata, snd_pcm_t *in_phandle, int in_err)
 {
+	auto& reference = Anki::AudioEngine::PlugIns::GetAecPlaybackReference();
+	if (reference.Enabled()) { reference.ReportError(); }
 	AkAlsaSink *  pAlsaSinkDevice = (AkAlsaSink *)in_puserdata;
 	int returnVal=0;
 
@@ -271,6 +274,27 @@ AK_DECLARE_THREAD_ROUTINE(AlsaSinkAudioThread)
 			}
 			else
 			{
+				auto& reference = Anki::AudioEngine::PlugIns::GetAecPlaybackReference();
+				if (reference.Enabled()) {
+					snd_pcm_sframes_t delay = 0;
+					if (framesWritten != pAlsaSinkDevice->m_uFrameSize ||
+					    snd_pcm_delay(pAlsaSinkDevice->m_pPcmHandle, &delay) < 0 ||
+					    delay < framesWritten) {
+						if (framesWritten > 0) {
+							reference.CaptureUnclockedAccepted(nextPeriod, framesWritten,
+								pAlsaSinkDevice->m_uSampleRate, pAlsaSinkDevice->m_uOutNumChannels);
+						}
+						reference.ReportError();
+					} else {
+						const auto startNs = reference.NowNs() +
+							(delay - framesWritten) * 1000000000LL / pAlsaSinkDevice->m_uSampleRate;
+						// Q6's PCM pointer advances only at period interrupts. Its
+						// delay estimate has a whole period of phase uncertainty.
+						const auto uncertaintyNs = static_cast<int64_t>(framesWritten) * 31250 + 2000000;
+						reference.PushClocked(nextPeriod, framesWritten, pAlsaSinkDevice->m_uSampleRate,
+						               pAlsaSinkDevice->m_uOutNumChannels, startNs, uncertaintyNs);
+					}
+				}
 				pAlsaSinkDevice->_sinkPluginBuffer.pop_front();
 			}
 

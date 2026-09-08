@@ -34,10 +34,12 @@ namespace {
   const std::string kRawFileExtension = "_raw.wav";
 }
 
-void MicDataInfo::CollectRawAudio(const AudioUtil::AudioSample* audioChunk, size_t size)
+void MicDataInfo::CollectRawAudio(const AudioUtil::AudioSample* audioChunk, size_t size,
+                                  uint64_t sequence, int64_t captureTime_ns)
 {
   std::lock_guard<std::mutex> lock(_dataMutex);
-  if (_typesToCollect.IsBitFlagSet(MicDataType::Raw))
+  if (sequence >= _minimumCaptureSequence && captureTime_ns >= _minimumCaptureTime_ns &&
+      _typesToCollect.IsBitFlagSet(MicDataType::Raw))
   {
     AudioUtil::AudioChunk newChunk;
     newChunk.resize(kIncomingAudioChunkSize);
@@ -51,10 +53,12 @@ void MicDataInfo::CollectRawAudio(const AudioUtil::AudioSample* audioChunk, size
   }
 }
 
-void MicDataInfo::CollectProcessedAudio(const AudioUtil::AudioSample* audioChunk, size_t size)
+void MicDataInfo::CollectProcessedAudio(const AudioUtil::AudioSample* audioChunk, size_t size,
+                                        uint64_t sequence, int64_t captureTime_ns)
 {
   std::lock_guard<std::mutex> lock(_dataMutex);
-  if (_typesToCollect.IsBitFlagSet(MicDataType::Processed))
+  if (sequence >= _minimumCaptureSequence && captureTime_ns >= _minimumCaptureTime_ns &&
+      _typesToCollect.IsBitFlagSet(MicDataType::Processed))
   {
     AudioUtil::AudioChunk newChunk;
     newChunk.resize(kSamplesPerBlockPerChannel);
@@ -76,6 +80,12 @@ void MicDataInfo::CollectProcessedAudio(const AudioUtil::AudioSample* audioChunk
     }
     _processedAudioData.push_back(std::move(newChunk));
   }
+}
+
+bool MicDataInfo::HasCapturedAudio() const
+{
+  std::lock_guard<std::mutex> lock(_dataMutex);
+  return !_processedAudioData.empty();
 }
 
 AudioUtil::AudioChunkList MicDataInfo::GetProcessedAudio(size_t beginIndex)
@@ -105,6 +115,13 @@ void MicDataInfo::SetTimeToRecord(uint32_t timeToRecord)
 {
   std::lock_guard<std::mutex> lock(_dataMutex);
   _timeToRecord_ms = timeToRecord;
+}
+
+void MicDataInfo::StopCollecting()
+{
+  std::lock_guard<std::mutex> lock(_dataMutex);
+  _typesToCollect.ClearFlags();
+  _timeToRecord_ms = 0;
 }
 
 void MicDataInfo::SetAudioFadeInTime(uint32_t fadeInTime_ms)
@@ -227,8 +244,11 @@ void MicDataInfo::SaveCollectedAudio(const std::string& dataDirectory,
         Anki::Util::SetThreadName(pthread_self(), "saveRawWave");
         if (saveRaw)
         {
-          AudioUtil::WaveFile::SaveFile(dest, data, kNumInputChannels, kSampleRateIncoming_hz);
-          LOG_INFO("MicDataInfo.WriteRawWaveFile", "%s", dest.c_str());
+          if (AudioUtil::WaveFile::SaveFile(dest, data, kNumInputChannels, kSampleRateIncoming_hz)) {
+            LOG_INFO("MicDataInfo.WriteRawWaveFile", "%s", dest.c_str());
+          } else {
+            LOG_ERROR("MicDataInfo.WriteRawWaveFile", "Failed to save %s", dest.c_str());
+          }
         }
         
         if (doFFTProcess)
@@ -267,8 +287,11 @@ void MicDataInfo::SaveCollectedAudio(const std::string& dataDirectory,
       auto saveProcessedWave = [dest = std::move(dest),
                                 data = std::move(_processedAudioData)] () {
         Anki::Util::SetThreadName(pthread_self(), "saveProcWave");
-        AudioUtil::WaveFile::SaveFile(dest, data);
-        LOG_INFO("MicDataInfo.WriteProcessedWaveFile", "%s", dest.c_str());
+        if (AudioUtil::WaveFile::SaveFile(dest, data)) {
+          LOG_INFO("MicDataInfo.WriteProcessedWaveFile", "%s", dest.c_str());
+        } else {
+          LOG_ERROR("MicDataInfo.WriteProcessedWaveFile", "Failed to save %s", dest.c_str());
+        }
       };
       std::thread(saveProcessedWave).detach();
     }

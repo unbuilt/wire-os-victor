@@ -183,7 +183,8 @@ u16 GetRawCliffData(const CliffID cliff_id);
  * \section Microphones
  */
 
-using SendDataFunction = Result (*)(const s16* latestMicData, uint32_t numSamples);
+using SendDataFunction = Result (*)(const s16* latestMicData, uint32_t numSamples,
+                                   uint32_t sourceFrame, uint64_t receivedNs, bool timingValid);
 
 /** Grants access to microphone data from this tick.
  * @param[in] Provides a function pointer for actually sending out the message using the mic data

@@ -263,6 +263,7 @@ add_library(audio_engine
   ${AUDIO_ENGINE_DIR}/audioTools/audioWaveFileReader.cpp
   ${AUDIO_ENGINE_DIR}/audioTools/streamingWaveDataInstance.cpp
   ${AUDIO_ENGINE_DIR}/plugins/akAlsaSinkPlugIn.cpp
+  ${AUDIO_ENGINE_DIR}/plugins/aecDiagnosticCapture.cpp
   ${AUDIO_ENGINE_DIR}/plugins/ankiPluginInterface.cpp
   ${AUDIO_ENGINE_DIR}/plugins/hijackAudioPlugIn.cpp
   ${AUDIO_ENGINE_DIR}/plugins/wavePortalPlugIn.cpp

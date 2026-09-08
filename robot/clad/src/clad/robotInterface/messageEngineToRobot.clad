@@ -439,7 +439,15 @@ message StartPlaybackAudio
 message StartWakeWordlessStreaming
 {
   uint_8 streamType,
-  bool   playGetInFromAnimProcess
+  bool   playGetInFromAnimProcess,
+  bool   freshCapture = 0,
+  uint_8 reserved = 0,
+  uint_32 streamId = 0
+}
+
+message StopWakeWordlessStreaming
+{
+  uint_32 streamId
 }
 
 message SetTriggerWordResponse
@@ -695,13 +703,15 @@ message AcousticTestEnabled {
 //
 message ExternalAudioPrepare {
   uint_16 audio_volume,
-  uint_16 audio_rate
+  uint_16 audio_rate,
+  uint_32 playbackId = 0
 }
 
 //
 // Sent from engine to robot (anim process) to stream audio data to the robot speaker
 //
 message ExternalAudioChunk {
+  uint_32 playbackId = 0,
   uint_16 audio_chunk_size,       //size in bytes
   uint_16 audio_chunk_data[512]   //16-bit little-endian data
 }
@@ -710,12 +720,14 @@ message ExternalAudioChunk {
 // Sent from engine to robot (anim process) to signal end of streaming data
 //
 message ExternalAudioComplete {
+  uint_32 playbackId = 0
 }
 
 //
 // Sent from engine to robot (anim process) to cancel streaming audio playback
 //
 message ExternalAudioCancel {
+  uint_32 playbackId = 0
 }
 
 // Because we're running low on message tags, expand this enum and message as we add more settings
@@ -882,7 +894,7 @@ union EngineToRobot
   SetDebugConsoleVarMessage     setDebugConsoleVarMessage   = 0x90,
   RunDebugConsoleFuncMessage    runDebugConsoleFuncMessage  = 0x91,
   TextToSpeechPrepare           textToSpeechPrepare         = 0x92,
-  // Available                                              = 0x93,
+  StopWakeWordlessStreaming     stopWakeWordlessStreaming   = 0x93,
   TextToSpeechPlay              textToSpeechPlay            = 0x94,
   TextToSpeechCancel            textToSpeechCancel          = 0x95,
 

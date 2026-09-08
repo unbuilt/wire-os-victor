@@ -36,6 +36,7 @@ class FaceWorld;
 class HeldInPalmTracker;
 class BEIRobotInfo;
 class UserIntentComponent;
+class ConversationSessionComponent;
 class UserDefinedBehaviorTreeComponent;
 class ActiveFeatureComponent;
 class ActiveBehaviorIterator;
@@ -68,6 +69,7 @@ LINK_COMPONENT_TYPE_TO_ENUM(HeldInPalmTracker,                  BCComponentID, H
 LINK_COMPONENT_TYPE_TO_ENUM(BEIRobotInfo,                       BCComponentID, RobotInfo)
 LINK_COMPONENT_TYPE_TO_ENUM(UserDefinedBehaviorTreeComponent,   BCComponentID, UserDefinedBehaviorTreeComponent)
 LINK_COMPONENT_TYPE_TO_ENUM(UserIntentComponent,                BCComponentID, UserIntentComponent)
+LINK_COMPONENT_TYPE_TO_ENUM(ConversationSessionComponent,       BCComponentID, ConversationSessionComponent)
 LINK_COMPONENT_TYPE_TO_ENUM(ActiveFeatureComponent,             BCComponentID, ActiveFeature)
 LINK_COMPONENT_TYPE_TO_ENUM(ActiveBehaviorIterator,             BCComponentID, ActiveBehaviorIterator)
 LINK_COMPONENT_TYPE_TO_ENUM(BehaviorsBootLoader,                BCComponentID, BehaviorsBootLoader)
@@ -113,6 +115,7 @@ std::string GetComponentStringForID<Vector::BCComponentID>(Vector::BCComponentID
     CASE(OnboardingMessageHandler)
     CASE(UserDefinedBehaviorTreeComponent)
     CASE(UserIntentComponent)
+    CASE(ConversationSessionComponent)
     CASE(Count)
   }
   #undef CASE

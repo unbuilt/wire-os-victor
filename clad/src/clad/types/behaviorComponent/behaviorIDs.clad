@@ -213,6 +213,7 @@ enum uint_16 BehaviorID {
 
   // victorBehaviorTree/highLevelDelegates/knowledgeGraph
   KnowledgeGraphQuestion,
+  ConversationFollowUp,
   KnowledgeGraphTTS,
 
   // victorBehaviorTree/highLevelDelegates

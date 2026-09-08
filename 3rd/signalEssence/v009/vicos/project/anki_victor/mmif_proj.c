@@ -15,6 +15,7 @@
 #include "mmfxpub.h"
 #include "mmif.h"
 #include "mmif_proj.h"
+#include "aecExperiment.h"
 #include "policy_actions.h"
 #include "sercvpub.h"
 #include "spatialfilterconfig.h"
@@ -50,7 +51,8 @@ extern SpatialFilterSpec_t     SpatialFilterSpec;
 extern LocationToBeamMapping_t LocationToBeamMapping;
 
 #define MMIF_LEN_SCRATCH_X (1830 * 1000)
-#define MMIF_LEN_SCRATCH_H (2    * 1000)
+// The enabled TD canceller needs more than the original 2 KB bypass-only pool.
+#define MMIF_LEN_SCRATCH_H (8    * 1000)
 #define MMIF_LEN_SCRATCH_S (2000 * 1000)
 char pScratchH[MMIF_LEN_SCRATCH_H];
 char pScratchX[MMIF_LEN_SCRATCH_X];
@@ -453,6 +455,7 @@ void MMIfInit(float32 additionalRefDelaySec, void *pArgs)
                            pScratchX, MMIF_LEN_SCRATCH_X,
                            pScratchS, MMIF_LEN_SCRATCH_S);
     ConfigAec(pMMFxConfig, sendSampleRateHz, AEC_LEN_CHAN_MODEL_SEC);
+    AnkiAecExperimentConfigure(pMMFxConfig);
 
     // update non default parameters for the Frequency Domain beam search
     pMMFxConfig->FdBeamSearchConfig.NumMics = (uint16)MMIfNumMics;

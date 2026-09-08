@@ -86,8 +86,9 @@ namespace Anki
       void CancelCloudAudioPlayback();
       // play the success get-out exactly once when cloud audio finishes (or times out)
       // abandon a broken cloud stream: fall back to local TTS if configured, else fail out
-      void FailCloudAudioResponse();
+      void FailCloudAudioResponse(bool quiet = false);
       void FinishCloudAudioResponse();
+      void PlaySuccessfulResponseGetOut();
       // decide whether this response should use cloud audio or local TTS
       bool ShouldUseCloudAudio() const;
 
@@ -157,6 +158,7 @@ namespace Anki
         double cloudAudioReadyTimeout = 5.0;      // seconds to wait for the PCM stream before falling back
         bool cloudAudioFallbackToLocalTts = true; // on error/timeout, speak with local TTS
         uint32_t cloudAudioVolume = 100;          // volume passed to the streaming player
+        Json::Value multiTurnVoice;
 
       } _iVars;
 
@@ -169,6 +171,7 @@ namespace Anki
 
         EState state;
         double streamingBeginTime;             // the time we begun actually streaming the mic data
+        double streamingRequestTime = 0;
         std::string responseString;            // the text we got back from knowledge graph
         EGenerationStatus ttsGenerationStatus; // track the status of the response tts
         BackpackLightDataLocator lightsHandle; // lights, camera, action!
@@ -190,6 +193,8 @@ namespace Anki
         bool cloudAudioCompleteSent = false;     // ExternalAudioComplete has been sent
         double cloudAudioCompletionDeadline = 0.0;
         bool cloudAudioResponseFinished = false; // success get-out already handled
+        uint64_t conversationToken = 0;
+        uint32_t playbackId = 0;
 
       } _dVars;
 

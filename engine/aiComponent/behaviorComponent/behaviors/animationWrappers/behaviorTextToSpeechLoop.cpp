@@ -126,10 +126,14 @@ void BehaviorTextToSpeechLoop::SetTextToSay(const std::string& textToSay,
                                             const UtteranceReadyCallback readyCallback,
                                             const AudioTtsProcessingStyle style)
 {
+  ClearTextToSay();
+  _playbackOutcome = PlaybackOutcome::Cancelled;
+  const auto generation = ++_utteranceGeneration;
   _dVars.textToSay = textToSay;
 
-  auto callback = [this, readyCallback{std::move(readyCallback)}](const UtteranceState& utteranceState)
+  auto callback = [this, generation, readyCallback{std::move(readyCallback)}](const UtteranceState& utteranceState)
   {
+    if (generation != _utteranceGeneration) { return; }
     const bool wasGenerating = (UtteranceState::Generating == _dVars.utteranceState);
     OnUtteranceUpdated(utteranceState);
 
@@ -165,6 +169,7 @@ void BehaviorTextToSpeechLoop::SetTextToSay(const std::string& textToSay,
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 void BehaviorTextToSpeechLoop::ClearTextToSay()
 {
+  ++_utteranceGeneration;
   if(kInvalidUtteranceID != _dVars.utteranceID) {
     GetBEI().GetTextToSpeechCoordinator().CancelUtterance(_dVars.utteranceID);
   }
@@ -207,6 +212,7 @@ void BehaviorTextToSpeechLoop::OnBehaviorActivated()
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 void BehaviorTextToSpeechLoop::OnBehaviorDeactivated()
 {
+  ++_utteranceGeneration;
   // make sure we clean up our utterance data else we'll leak the wav data
   if((UtteranceState::Invalid != _dVars.utteranceState) && (UtteranceState::Finished != _dVars.utteranceState)){
     GetBEI().GetTextToSpeechCoordinator().CancelUtterance(_dVars.utteranceID);
@@ -308,17 +314,25 @@ void BehaviorTextToSpeechLoop::TransitionToSpeakingLoop()
 void BehaviorTextToSpeechLoop::TransitionToGetOut()
 {
   SET_STATE(GetOut);
-  if(AnimationTrigger::Count == _iConfig.getOutTrigger){
+  auto finished = [this](ActionResult result) {
+    if (result == ActionResult::SUCCESS && _dVars.hasSentPlayCommand &&
+        _dVars.utteranceState == UtteranceState::Finished && !_dVars.cancelOnNextLoop) {
+      _playbackOutcome = PlaybackOutcome::Succeeded;
+    }
     CancelSelf();
+  };
+  if(AnimationTrigger::Count == _iConfig.getOutTrigger){
+    finished(ActionResult::SUCCESS);
   } else {
     DelegateIfInControl(new TriggerLiftSafeAnimationAction(_iConfig.getOutTrigger, 1, true, _iConfig.tracksToLock),
-                        [this](){ CancelSelf(); } );
+                        finished);
   }
 }
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 void BehaviorTextToSpeechLoop::TransitionToEmergencyGetOut()
 {
+  _playbackOutcome = PlaybackOutcome::Failed;
   SET_STATE(EmergencyGetOut);
   ClearTextToSay();
 
@@ -360,6 +374,7 @@ void BehaviorTextToSpeechLoop::OnUtteranceUpdated(const UtteranceState& state)
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 void BehaviorTextToSpeechLoop::Interrupt( bool immediate )
 {
+  _playbackOutcome = PlaybackOutcome::Cancelled;
   if(immediate){
     CancelDelegates(false);
     TransitionToEmergencyGetOut();

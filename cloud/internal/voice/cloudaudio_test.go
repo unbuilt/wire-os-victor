@@ -3,6 +3,7 @@ package voice
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -208,6 +209,28 @@ func TestSendCloudAudioErrorOnBadStatus(t *testing.T) {
 	}
 }
 
+func TestCloudAudioFetchFailuresAreNotQuietInterruptions(t *testing.T) {
+	for _, status := range []int{401, 403, 404, 500, 0} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+			}))
+			defer srv.Close()
+			if status == 0 {
+				srv.Close() // Connection establishment failure, before any answer body.
+			}
+			collector := &collectSender{}
+			p := &Process{intents: []MsgSender{collector}}
+			p.sendCloudAudio(srv.URL, "answer", "audio", "answer")
+			msgs := collector.snapshot()
+			if len(msgs) != 1 || msgs[0].GetResponseAudioError() == nil ||
+				msgs[0].GetResponseAudioError().Error != cloud.ResponseAudioErrorType_Provider {
+				t.Fatal("ordinary fetch/authentication errors must retain fallback handling")
+			}
+		})
+	}
+}
+
 func TestMaybeSendCloudAudioDisabledIsNoop(t *testing.T) {
 	os.Unsetenv("VECTOR_KG_TTS_URL")
 	collector := &collectSender{}
@@ -375,20 +398,155 @@ func TestStreamCloudAudioKeepsFramesIntact(t *testing.T) {
 	}
 }
 
-func TestStreamCloudAudioDropsTrailingOddByte(t *testing.T) {
+func TestStreamCloudAudioRejectsTrailingOddByte(t *testing.T) {
 	collector := &collectSender{}
 	p := &Process{intents: []MsgSender{collector}}
 
 	pcm := append(makePCM(10), 0xFF)
-	if _, _, err := p.streamCloudAudio("resp-odd", bytes.NewReader(pcm)); err != nil {
-		t.Fatalf("streamCloudAudio: %v", err)
+	if _, _, err := p.streamCloudAudio("resp-odd", bytes.NewReader(pcm)); err == nil {
+		t.Fatal("incomplete sample must not be reported as successful audio")
 	}
 	var reassembled []byte
 	for _, m := range collector.snapshot() {
 		reassembled = append(reassembled, m.GetResponseAudioChunk().Data...)
 	}
-	if len(reassembled) != 20 {
-		t.Errorf("forwarded %d bytes, want the trailing odd byte dropped (20)", len(reassembled))
+	if len(reassembled) != 0 {
+		t.Errorf("forwarded incomplete final buffer of %d bytes", len(reassembled))
+	}
+}
+
+func answerFrame(kind byte, payload []byte) []byte {
+	header := make([]byte, 5)
+	header[0] = kind
+	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
+	return append(header, payload...)
+}
+
+func TestFramedCloudAudioTerminalOutcomes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		tail    []byte
+		kind    cloud.ResponseAudioErrorType
+		success bool
+	}{
+		{"end", answerFrame(1, nil), 0, true},
+		{"cancelled", answerFrame(2, nil), cloud.ResponseAudioErrorType_Cancelled, false},
+		{"connection", answerFrame(3, nil), cloud.ResponseAudioErrorType_Transport, false},
+		{"provider", answerFrame(4, nil), cloud.ResponseAudioErrorType_Provider, false},
+		{"http-eof-without-end", nil, cloud.ResponseAudioErrorType_Transport, false},
+		{"truncated-terminal", []byte{1, 0}, cloud.ResponseAudioErrorType_Transport, false},
+		{"truncated-pcm", answerFrame(0, []byte{1, 2})[:6], cloud.ResponseAudioErrorType_Transport, false},
+		{"invalid-terminal", answerFrame(2, []byte{1}), cloud.ResponseAudioErrorType_InvalidFormat, false},
+		{"unknown-frame", answerFrame(99, nil), cloud.ResponseAudioErrorType_InvalidFormat, false},
+		{"trailing-data", append(answerFrame(1, nil), 42), cloud.ResponseAudioErrorType_InvalidFormat, false},
+		{"oversized-frame", answerFrame(0, make([]byte, 1025)), cloud.ResponseAudioErrorType_InvalidFormat, false},
+	} {
+		for _, partial := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/partial=%t", tc.name, partial), func(t *testing.T) {
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Header.Get("Accept") != cloudAudioFramedType {
+						t.Error("framing not negotiated")
+					}
+					w.Header().Set("Content-Type", cloudAudioFramedType)
+					if partial {
+						w.Write(answerFrame(0, makePCM(512)))
+					}
+					w.Write(tc.tail)
+				}))
+				defer srv.Close()
+				collector := &collectSender{}
+				p := &Process{intents: []MsgSender{collector}}
+				p.beginAudioOwner(42)
+				p.sendCloudAudio(srv.URL, "answer", "audio", "partial answer")
+				msgs := collector.snapshot()
+				last := msgs[len(msgs)-1]
+				if tc.success && partial {
+					if last.GetResponseAudioEnd() == nil {
+						t.Fatal("complete answer did not end")
+					}
+				} else {
+					err := last.GetResponseAudioError()
+					want := tc.kind
+					if tc.success {
+						want = cloud.ResponseAudioErrorType_Provider
+					}
+					if err == nil || err.Error != want || err.StreamId != 42 {
+						t.Fatalf("wrong terminal: %v, want %v", last, want)
+					}
+					for _, msg := range msgs {
+						if msg.GetResponseAudioEnd() != nil {
+							t.Fatal("failed answer reported success")
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestFramedCloudAudioForwardsBeforeLateAbort(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", cloudAudioFramedType)
+		w.Write(answerFrame(0, makePCM(512)))
+		w.(http.Flusher).Flush()
+		<-release
+		w.Write(answerFrame(2, nil))
+	}))
+	defer srv.Close()
+	defer close(release)
+	collector := &collectSender{}
+	p := &Process{intents: []MsgSender{collector}}
+	done := make(chan struct{})
+	go func() { p.sendCloudAudio(srv.URL, "answer", "audio", "first sentence"); close(done) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for len(collector.snapshot()) < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	msgs := collector.snapshot()
+	if len(msgs) != 2 || msgs[1].GetResponseAudioChunk() == nil {
+		t.Fatal("first sentence buffered until termination")
+	}
+	// Unblock without closing twice in the deferred failure cleanup.
+	release <- struct{}{}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("late abort did not terminate")
+	}
+	msgs = collector.snapshot()
+	if len(msgs) != 3 || msgs[2].GetResponseAudioError().Error != cloud.ResponseAudioErrorType_Cancelled {
+		t.Fatal("late abort must send Cancelled, never End")
+	}
+}
+
+func TestFramedEndStillRequiresCompleteHTTPBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", cloudAudioFramedType)
+		w.Write(answerFrame(0, makePCM(512)))
+		w.Write(answerFrame(1, nil))
+		w.(http.Flusher).Flush()
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		conn.Close()
+	}))
+	defer srv.Close()
+	collector := &collectSender{}
+	p := &Process{intents: []MsgSender{collector}}
+	p.sendCloudAudio(srv.URL, "answer", "audio", "answer")
+	msgs := collector.snapshot()
+	last := msgs[len(msgs)-1].GetResponseAudioError()
+	if last == nil || last.Error != cloud.ResponseAudioErrorType_Transport {
+		t.Fatal("missing HTTP terminator must remain a transport failure even after END")
+	}
+	for _, msg := range msgs {
+		if msg.GetResponseAudioEnd() != nil {
+			t.Fatal("truncated HTTP transfer emitted successful completion")
+		}
 	}
 }
 

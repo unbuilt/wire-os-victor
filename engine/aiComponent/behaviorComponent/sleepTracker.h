@@ -39,6 +39,7 @@ public:
   virtual void UpdateDependent(const BCCompMap& dependentComps) override;
 
   void SetIsSleeping(bool sleeping);
+  bool IsSleeping() const { return _asleep; }
 
   // true if the robot has accumulated enough "sleep debt" to want to sleep for at least an hour (if not
   // coming from sleep). If coming from sleep, then remain sleepy until sleep debt goes to zero. Does not take

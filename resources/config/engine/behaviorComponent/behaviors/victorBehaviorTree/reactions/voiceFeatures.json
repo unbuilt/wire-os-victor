@@ -33,6 +33,7 @@
     "MeetVictor",
     "ReactToAffirmative", // must come somewhere after blackjack or other behaviors which use the affirmative intent
     "ReactToNegative", // must come somewhere after blackjack or other behaviors which use the negative intent
-    "DanceToTheBeatVoiceCommand"
+    "DanceToTheBeatVoiceCommand",
+    "ConversationFollowUp"
   ]
 }

@@ -39,6 +39,9 @@ public:
   bool                          _repeating        = false;
   uint32_t                      _numMaxFiles      = kDefaultFilesToCapture;
   CloudMic::StreamType          _type             = CloudMic::StreamType::Normal;
+  uint32_t                     _streamId         = 0;
+  uint64_t                     _minimumCaptureSequence = 0;
+  int64_t                      _minimumCaptureTime_ns = 0;
   std::string                   _writeLocationDir;
   std::string                   _writeNameBase;
 
@@ -51,15 +54,20 @@ public:
   std::function<void(const std::string&)> _audioSaveCallback;
 
   void SetTimeToRecord(uint32_t timeToRecord);
+  void StopCollecting();
   
   // Add a linear fade to the begining of the stream
   // Note: Must set the fade in duration before CollectProcessedAudio() is called, default duration is 0 (no fade)
   void SetAudioFadeInTime(uint32_t fadeInTime_ms);
   
-  void CollectRawAudio(const AudioUtil::AudioSample* audioChunk, size_t size);
-  void CollectProcessedAudio(const AudioUtil::AudioSample* audioChunk, size_t size);
+  void CollectRawAudio(const AudioUtil::AudioSample* audioChunk, size_t size,
+                       uint64_t sequence = 0, int64_t captureTime_ns = 0);
+  void CollectProcessedAudio(const AudioUtil::AudioSample* audioChunk, size_t size,
+                             uint64_t sequence = 0, int64_t captureTime_ns = 0);
 
   AudioUtil::AudioChunkList GetProcessedAudio(size_t beginIndex);
+  bool IsFreshCapture() const { return _minimumCaptureSequence != 0; }
+  bool HasCapturedAudio() const;
   void UpdateForNextChunk();
   bool CheckDone() const;
   uint32_t GetTimeToRecord_ms() const;

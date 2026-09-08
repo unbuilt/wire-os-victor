@@ -12,6 +12,7 @@
 
 
 #include "audioEngine/plugins/akAlsaSinkPlugIn.h"
+#include "audioEngine/plugins/aecPlaybackReference.h"
 
 #if defined VICOS && not defined EXCLUDE_ANKI_AUDIO_LIBS
 #include "AkAlsaSink.h"
@@ -24,6 +25,14 @@ namespace Anki {
 namespace AudioEngine {
 namespace PlugIns {
 
+namespace {
+AecPlaybackReference aecPlaybackReference;
+}
+
+AecPlaybackReference& GetAecPlaybackReference()
+{
+  return aecPlaybackReference;
+}
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 AkAlsaSinkPlugIn::AkAlsaSinkPlugIn()

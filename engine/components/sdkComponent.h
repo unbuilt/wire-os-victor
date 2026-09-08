@@ -83,10 +83,10 @@ public:
   // (e.g. Knowledge Graph cloud audio). Audio is 16-bit little-endian PCM; chunks
   // must be <= 1024 bytes. Playback auto-starts in the anim process after a short
   // prebuffer and reports completion via audioStreamStatusEvent.
-  void PrepareStreamingAudio(uint16_t audioRate, uint16_t audioVolume);
-  void SendStreamingAudioChunk(const uint8_t* data, uint16_t sizeBytes);
-  void CompleteStreamingAudio();
-  void CancelStreamingAudio();
+  void PrepareStreamingAudio(uint16_t audioRate, uint16_t audioVolume, uint32_t playbackId = 0);
+  void SendStreamingAudioChunk(const uint8_t* data, uint16_t sizeBytes, uint32_t playbackId = 0);
+  void CompleteStreamingAudio(uint32_t playbackId = 0);
+  void CancelStreamingAudio(uint32_t playbackId = 0);
 
 private:
 

@@ -12,6 +12,7 @@ option(SE_HIGHRES "Enable Signal Essence High Resolution Echo Cancelling" ON)
 include(signalessence)
 
 add_library(signal_essence STATIC
+  aecExperiment.c
   "${SIGNALESSENCE_PROJ_SRC}/crossoverconfig.c"
   "${SIGNALESSENCE_PROJ_SRC}/fdsearchconfig.c"
   "${SIGNALESSENCE_PROJ_SRC}/mmif_proj.c"
@@ -27,11 +28,15 @@ target_link_libraries(signal_essence
 )
 
 target_include_directories(signal_essence
+  PUBLIC
+  "${CMAKE_CURRENT_SOURCE_DIR}"
   INTERFACE
   ${SIGNALESSENCE_INCLUDE_PATHS}
 )
 
 target_compile_definitions(signal_essence
+  PRIVATE
+  ANKI_AEC_EXPERIMENT_SUPPORTED=$<AND:$<BOOL:${VICOS}>,$<BOOL:${SE_V009}>,$<NOT:$<BOOL:${STANDALONE_SIM}>>>
   PUBLIC
   SE_V009=$<BOOL:${SE_V009}>
 )

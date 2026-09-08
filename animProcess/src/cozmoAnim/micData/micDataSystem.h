@@ -88,7 +88,9 @@ public:
   void ProcessMicDataPayload(const RobotInterface::MicData& payload);
   void RecordRawAudio(uint32_t duration_ms, const std::string& path, bool runFFT);
   void RecordProcessedAudio(uint32_t duration_ms, const std::string& path);
-  void StartWakeWordlessStreaming(CloudMic::StreamType type, bool playGetInFromAnimProcess);
+  void StartWakeWordlessStreaming(CloudMic::StreamType type, bool playGetInFromAnimProcess,
+                                 uint32_t streamId = 0, bool freshCapture = false);
+  void StopWakeWordlessStreaming(uint32_t streamId);
   void FakeTriggerWordDetection();
   void Update(BaseStationTime_t currTime_nanosec);
 
@@ -170,6 +172,9 @@ private:
   BaseStationTime_t _streamBeginTime_ns = 0;
   bool _currentlyStreaming = false;
   bool _streamingComplete = false;
+  uint32_t _pendingStreamId = 0;
+  uint64_t _wakeWordlessGeneration = 0;
+  bool _wakeWordlessPending = false;
 #if ANKI_DEV_CHEATS
   bool _fakeStreamingState = false;
 #endif
@@ -224,6 +229,8 @@ private:
   void SetupConsoleFuncs();
   void RecordAudioInternal(uint32_t duration_ms, const std::string& path, MicDataType type, bool runFFT);
   void ClearCurrentStreamingJob();
+  void SendMicStreamState(uint32_t streamId, bool open);
+  void NotifyCaptureStarted();
   float GetIncomingMicDataPercentUsed();
   void SendUdpMessage(const CloudMic::Message& msg);
   

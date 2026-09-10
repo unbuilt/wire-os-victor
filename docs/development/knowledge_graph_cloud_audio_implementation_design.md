@@ -663,7 +663,8 @@ After `ConsumeResponse` or `ConsumeIntentGraphResponse`:
 3. Enter the existing `Searching` animation while waiting for audio readiness.
 4. If cloud audio reaches `Ready`, select `CloudAudio`.
 5. If it fails or misses the readiness timeout, start local TTS generation and select `LocalTts`.
-6. Transition through `KnowledgeGraphSearchingGetOutSuccess`.
+6. For local TTS, transition through `KnowledgeGraphSearchingGetOutSuccess`.
+   Ready cloud audio skips this transition (see section 29).
 7. Enter `Responding` and start the selected renderer.
 8. On renderer completion, play `KnowledgeGraphSuccessReaction`.
 
@@ -1187,3 +1188,36 @@ compiler; the container build required the existing writable caches and explicit
 release/tool definitions (this project's CMake clears stale command-line
 definitions on regeneration). Final incremental ARM build succeeded. No version
 bump, packaging, installation or hardware/acoustic validation was performed.
+
+## 29. Cloud audio starts without waiting for search animations
+
+While `Searching` with a cloud response, `BehaviorUpdate` checks readiness,
+errors, and the existing readiness deadline on every behavior update. Once
+actionable, it calls `CancelDelegates(false)` to suppress the cancelled search
+animation's completion callback and reuses the existing readiness/error path.
+Ready cloud audio transitions directly to `Responding` and starts its renderer,
+without `KnowledgeGraphSearchingGetOutSuccess`.
+
+This can interrupt either the initial searching get-in/loop sequence or a later
+loop. The packaged asset manifest lists the searching loop as 1,188 ms and its
+success exit as 297 ms; neither is now a prerequisite for cloud playback. These
+are animation durations, not measured end-to-end latency savings.
+
+The 24,000-byte prebuffer (750 ms of 16 kHz mono PCM16), completed-short-answer
+readiness, playback pacing, response ownership, and local-TTS animation path are
+unchanged. Cancellation/transport errors still stop quietly; ordinary failures
+retain the existing local fallback policy. Readiness deadlines are no longer
+delayed until a search animation callback.
+
+The existing production-extraction routing harness covers a buffer crossing the
+unchanged threshold between updates, callback-disabled cancellation, immediate
+PCM submission with no exit delegation, no duplicate renderer preparation,
+unchanged local-TTS delegation, and error/deadline handling during search.
+This is a robot-firmware change only; no Lycopod changes are required.
+
+Cloud-answer admission also omits the Knowledge Graph end earcon
+(`Wake_Word_Success`). The decision is made after consuming either the prompted
+or bypass response, so a valid cloud answer starts without this extra chime.
+Local-only/disabled-cloud responses and missing answers retain the earcon;
+wake and listening-start cues are unchanged. Later cloud failure retains the
+existing fallback policy without inserting a delayed acknowledgement.

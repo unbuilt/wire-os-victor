@@ -22,6 +22,7 @@
 #define DASMSG_SEND(...)
 #define USER_INTENT(x) UserIntentTag::x
 #define FLT_NEAR(a, b) (std::abs((a) - (b)) < .0001)
+#define DEV_ASSERT(condition, ...) EXPECT_TRUE(condition)
 
 namespace Anki { namespace Vector {
 namespace RobotInterface {
@@ -151,7 +152,7 @@ public:
   void Update();
 };
 enum class AnimationTrigger { VC_ListeningGetOut, VC_ListeningLoop, KnowledgeGraphSearchingFailGetOut,
-                              KnowledgeGraphSearching, KnowledgeGraphSearchingFail,
+                              KnowledgeGraphSearching, KnowledgeGraphSearchingGetIn, KnowledgeGraphSearchingFail,
                               KnowledgeGraphSearchingGetOutSuccess };
 struct TriggerAnimationAction { explicit TriggerAnimationAction(AnimationTrigger) {} };
 using TriggerLiftSafeAnimationAction = TriggerAnimationAction;
@@ -207,9 +208,13 @@ struct SDKComponent {
 };
 class BehaviorKnowledgeGraphQuestion {
 public:
+  struct Tts {
+    unsigned requests = 0;
+    template<class F> void SetTextToSay(const std::string&, F) { ++requests; }
+  };
   UserIntentComponent& uic;
   explicit BehaviorKnowledgeGraphQuestion(UserIntentComponent& u) : uic(u) {}
-  enum class EState { WaitingToStream, Listening, Responding, Interrupted };
+  enum class EState { WaitingToStream, Listening, Searching, Responding, Interrupted };
   enum class EResponseSource { CloudAudio, LocalTts };
   enum class EGenerationStatus { None, Success, Fail };
   struct {
@@ -236,6 +241,8 @@ public:
     bool cloudAudioFallbackToLocalTts = true;
     unsigned cloudAudioVolume = 100;
     double streamingDuration = 10, cloudAudioRequestTimeout = 65;
+    double cloudAudioReadyTimeout = 20;
+    std::shared_ptr<Tts> ttsBehavior = std::make_shared<Tts>();
   } _iVars;
   struct {
     bool IsFinished() const { return true; }
@@ -246,24 +253,36 @@ public:
     Info& GetRobotInfo() { return *this; }
     Info& GetSDKComponent() { return *this; }
   } info;
-  unsigned opened = 0, responses = 0, failures = 0;
+  unsigned opened = 0, failures = 0, endEarcons = 0;
+  bool responsePending = false;
+  UserIntent_KnowledgeResponse promptedResponse;
+  unsigned delegateCancellations = 0, delegatedTransitions = 0;
+  bool cancellationAllowedCallback = false;
   bool cancelled = false;
   template<class T> T& GetBehaviorComp() { return uic; }
-  bool IsActivated() const { return true; }
+  bool IsActivated() const { return !cancelled; }
   Info& GetBEI() { return info; }
-  void CancelDelegates(bool) {}
+  void CancelDelegates(bool allowCallback) {
+    ++delegateCancellations;
+    cancellationAllowedCallback = allowCallback;
+  }
   bool IsControlDelegated() const { return true; }
   void CancelSelf() { cancelled = true; }
   template<class T> void DelegateIfInControl(T* action) { ++failures; delete action; }
-  template<class T, class F> void DelegateIfInControl(T* action, F) { delete action; }
-  void BeginStreamingQuestion() { ++opened; }
-  void OnStreamingComplete(bool bypass) {
-    EXPECT_TRUE(bypass);
-    ConsumeIntentGraphResponse();
-    ++responses;
-    _dVars.state = EState::Responding;
+  template<class T, class F> void DelegateIfInControl(T* action, F) {
+    ++delegatedTransitions;
+    delete action;
   }
-  bool IsResponsePending() const { return false; }
+  void BeginStreamingQuestion() { ++opened; }
+  void OnStreamingComplete(bool);
+  bool ShouldUseCloudAudio() const;
+  void PlayEarconEnd() { ++endEarcons; }
+  void ConsumeResponse() {
+    _dVars.responseString = promptedResponse.answer;
+    _dVars.responseId = promptedResponse.response_id;
+    _dVars.cloudAudioExpected = promptedResponse.cloud_audio_available;
+  }
+  bool IsResponsePending() const { return responsePending; }
   void TransitionToNoResponse() { ++failures; }
   void UpdateCloudAudioStreaming();
   void FailCloudAudioResponse(bool quiet = false);
@@ -273,7 +292,7 @@ public:
   void WaitOutCloudAudioPlayback() {}
   void BeginResponseCloudAudio();
   void TransitionToSearchingLoop();
-  void TransitionToBeginResponse() { ++responses; }
+  void TransitionToBeginResponse();
   void BehaviorUpdate();
   void ConsumeIntentGraphResponse();
 };
@@ -398,7 +417,7 @@ TEST(KnowledgeFollowUpRouting, ActualResultDispatchPreservesAudioAndNeverReopens
   BehaviorKnowledgeGraphQuestion kg(uic);
   kg.BehaviorUpdate();
   EXPECT_EQ(0u, kg.opened);
-  EXPECT_EQ(1u, kg.responses);
+  EXPECT_EQ(1u, kg._iVars.ttsBehavior->requests);
   EXPECT_EQ(response.answer, kg._dVars.responseString);
   EXPECT_EQ("answer-42", uic._cloudAudioExpectedId);
   EXPECT_TRUE(uic._cloudAudio.haveStart);
@@ -410,7 +429,7 @@ TEST(KnowledgeFollowUpRouting, ActualResultDispatchPreservesAudioAndNeverReopens
   EXPECT_TRUE(uic._cloudAudio.pcm.empty());
   EXPECT_TRUE(kg._dVars.cloudAudioExpected);
   kg.BehaviorUpdate();
-  EXPECT_EQ(1u, kg.responses);
+  EXPECT_EQ(1u, kg._iVars.ttsBehavior->requests);
   auto& session = uic.conversation.state;
   session.ResponseFinished(session.Token(), Outcome::Succeeded);
   session.Deactivated(2, 40);
@@ -811,5 +830,149 @@ TEST(KnowledgeFollowUpRouting, ReadinessTimeoutIsQuietOnlyForEstablishedAnswer)
       EXPECT_EQ(BehaviorKnowledgeGraphQuestion::EResponseSource::LocalTts, kg._dVars.responseSource);
     }
   }
+}
+
+TEST(KnowledgeFollowUpRouting, SuppressesAnswerEarconOnlyForCloudResponses)
+{
+  for (bool bypass : {false, true}) {
+    // Cloud answer, feature disabled, unadvertised audio, missing ID, empty answer.
+    for (int scenario = 0; scenario < 5; ++scenario) {
+      UserIntentComponent uic;
+      BehaviorKnowledgeGraphQuestion kg(uic);
+      UserIntent_KnowledgeResponse response;
+      response.answer = scenario == 4 ? "" : "Answer";
+      response.response_id = scenario == 3 ? "" : "answer";
+      response.cloud_audio_available = scenario != 2;
+      kg._iVars.cloudAudioEnabled = scenario != 1;
+      if (bypass) {
+        uic.active = std::make_shared<UserIntentData>();
+        uic.active->intent.response = response;
+      } else {
+        kg.responsePending = true;
+        kg.promptedResponse = response;
+      }
+      kg.OnStreamingComplete(bypass);
+      EXPECT_EQ(scenario == 0 ? 0u : 1u, kg.endEarcons);
+      EXPECT_EQ(scenario == 4 ? 0u : 1u, kg._iVars.ttsBehavior->requests);
+      if (scenario != 4) {
+        EXPECT_EQ(scenario == 0 ? BehaviorKnowledgeGraphQuestion::EResponseSource::CloudAudio
+                                : BehaviorKnowledgeGraphQuestion::EResponseSource::LocalTts,
+                  kg._dVars.responseSource);
+      }
+    }
+  }
+}
+
+TEST(KnowledgeFollowUpRouting, MissingAnswerStillPlaysEndEarcon)
+{
+  UserIntentComponent uic;
+  BehaviorKnowledgeGraphQuestion kg(uic);
+  kg.OnStreamingComplete(false);
+  EXPECT_EQ(1u, kg.endEarcons);
+  EXPECT_EQ(1u, kg.failures);
+}
+
+TEST(KnowledgeFollowUpRouting, ReadyCloudAudioInterruptsSearchOnNextUpdate)
+{
+  UserIntentComponent uic;
+  uic._expectedStreamId = 42;
+  BehaviorKnowledgeGraphQuestion kg(uic);
+  kg._dVars.state = BehaviorKnowledgeGraphQuestion::EState::Searching;
+  kg._dVars.responseSource = BehaviorKnowledgeGraphQuestion::EResponseSource::CloudAudio;
+  kg._dVars.responseId = "early";
+  kg._dVars.responseString = "Answer";
+  kg._dVars.cloudAudioReadyDeadline = Now() + 5;
+  uic.SetExpectedCloudAudioResponse("early");
+  AudioStart(uic, 42, "early");
+  CloudMic::ResponseAudioChunk chunk{};
+  chunk.streamId = 42;
+  chunk.responseId = "early";
+  chunk.data.assign(23998, 0x5a);
+  uic.OnCloudData(CloudMic::Message(std::move(chunk)));
+  kg.BehaviorUpdate();
+  EXPECT_EQ(0u, kg.delegateCancellations);
+  EXPECT_EQ(0u, kg.info.prepares);
+  CloudMic::ResponseAudioChunk finalChunk{};
+  finalChunk.streamId = 42;
+  finalChunk.responseId = "early";
+  finalChunk.sequenceNumber = 1;
+  finalChunk.data.assign(2, 0x5a);
+  uic.OnCloudData(CloudMic::Message(std::move(finalChunk)));
+  kg.BehaviorUpdate();
+  EXPECT_EQ(1u, kg.delegateCancellations);
+  EXPECT_FALSE(kg.cancellationAllowedCallback);
+  EXPECT_EQ(0u, kg.delegatedTransitions);
+  EXPECT_EQ(BehaviorKnowledgeGraphQuestion::EState::Responding, kg._dVars.state);
+  EXPECT_EQ(1u, kg.info.prepares);
+  EXPECT_EQ(24000u, kg.info.sent.size());
+  kg.BehaviorUpdate();
+  EXPECT_EQ(1u, kg.info.prepares);
+  EXPECT_EQ(1u, kg.delegateCancellations);
+}
+
+TEST(KnowledgeFollowUpRouting, LocalTtsStillWaitsForSearchAnimation)
+{
+  UserIntentComponent uic;
+  BehaviorKnowledgeGraphQuestion kg(uic);
+  kg._dVars.state = BehaviorKnowledgeGraphQuestion::EState::Searching;
+  kg._dVars.ttsGenerationStatus = BehaviorKnowledgeGraphQuestion::EGenerationStatus::Success;
+  kg.BehaviorUpdate();
+  EXPECT_EQ(0u, kg.delegateCancellations);
+  EXPECT_EQ(0u, kg.delegatedTransitions);
+  kg.TransitionToSearchingLoop();
+  EXPECT_EQ(1u, kg.delegatedTransitions);
+  EXPECT_EQ(0u, kg.info.prepares);
+}
+
+TEST(KnowledgeFollowUpRouting, SearchUpdateHandlesCloudErrorsBeforeAnimationCompletes)
+{
+  for (auto kind : {CloudMic::ResponseAudioErrorType::Cancelled,
+                    CloudMic::ResponseAudioErrorType::Transport,
+                    CloudMic::ResponseAudioErrorType::Provider}) {
+    UserIntentComponent uic;
+    uic._expectedStreamId = 42;
+    BehaviorKnowledgeGraphQuestion kg(uic);
+    kg._dVars.state = BehaviorKnowledgeGraphQuestion::EState::Searching;
+    kg._dVars.responseSource = BehaviorKnowledgeGraphQuestion::EResponseSource::CloudAudio;
+    kg._dVars.responseId = "failed";
+    kg._dVars.responseString = "Answer";
+    kg._dVars.cloudAudioReadyDeadline = Now() + 5;
+    uic.SetExpectedCloudAudioResponse("failed");
+    AudioStart(uic, 42, "failed");
+    CloudMic::ResponseAudioError error{};
+    error.streamId = 42;
+    error.responseId = "failed";
+    error.error = kind;
+    uic.OnCloudData(CloudMic::Message(std::move(error)));
+    kg.BehaviorUpdate();
+    EXPECT_GE(kg.delegateCancellations, 1u);
+    EXPECT_FALSE(kg.cancellationAllowedCallback);
+    EXPECT_EQ(0u, kg.info.prepares);
+    if (kind == CloudMic::ResponseAudioErrorType::Provider) {
+      EXPECT_FALSE(kg.cancelled);
+      EXPECT_EQ(BehaviorKnowledgeGraphQuestion::EResponseSource::LocalTts, kg._dVars.responseSource);
+    } else {
+      EXPECT_TRUE(kg.cancelled);
+      EXPECT_EQ(0u, kg.failures);
+      EXPECT_EQ(0u, kg.delegatedTransitions);
+    }
+  }
+}
+
+TEST(KnowledgeFollowUpRouting, SearchUpdateEnforcesEstablishedStreamDeadline)
+{
+  UserIntentComponent uic;
+  uic._expectedStreamId = 42;
+  BehaviorKnowledgeGraphQuestion kg(uic);
+  kg._dVars.state = BehaviorKnowledgeGraphQuestion::EState::Searching;
+  kg._dVars.responseSource = BehaviorKnowledgeGraphQuestion::EResponseSource::CloudAudio;
+  kg._dVars.responseId = "stalled";
+  kg._dVars.cloudAudioReadyDeadline = Now();
+  uic.SetExpectedCloudAudioResponse("stalled");
+  AudioStart(uic, 42, "stalled");
+  kg.BehaviorUpdate();
+  EXPECT_TRUE(kg.cancelled);
+  EXPECT_FALSE(kg.cancellationAllowedCallback);
+  EXPECT_EQ(0u, kg.info.prepares);
 }
 }}

@@ -444,8 +444,12 @@ including the gap between sentences.
 A pass should sound like this:
 
 - Vector enters the normal Knowledge Graph searching animation.
-- Speaking begins after approximately the first synthesized sentence is ready.
+- Speaking begins once cloud audio meets the existing 750 ms audio prebuffer
+  (or a shorter answer completes). Ready audio interrupts the searching animation;
+  it does not wait for the current loop or a success-exit animation to finish.
 - The answer uses lycopod's/provider's voice, not Vector's local Acapela voice.
+- Cloud answers omit the extra Knowledge Graph response acknowledgement chime;
+  wake/listening cues and local-only response cues remain unchanged.
 - Later sentences continue without truncating the answer.
 - Vector does not repeat the full answer in the local voice.
 - The normal success reaction occurs after playback.

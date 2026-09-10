@@ -320,6 +320,21 @@ namespace Anki
             OnStreamingComplete(false);
           }
         }
+        else if (EState::Searching == _dVars.state &&
+                 EResponseSource::CloudAudio == _dVars.responseSource)
+        {
+          uint32_t sampleRate = 0;
+          uint8_t channels = 0;
+          const double now = BaseStationTimer::getInstance()->GetCurrentTimeInSecondsDouble();
+          if (uic.HasCloudAudioError(_dVars.responseId) ||
+              uic.IsCloudAudioReady(_dVars.responseId, sampleRate, channels, kCloudAudioPrebufferBytes) ||
+              now >= _dVars.cloudAudioReadyDeadline)
+          {
+            // Do not let the cancelled search animation invoke its old transition.
+            CancelDelegates(false);
+            TransitionToSearchingLoop();
+          }
+        }
         else if (EState::Responding == _dVars.state)
         {
           // pace any remaining cloud audio out to the anim process
@@ -359,8 +374,6 @@ namespace Anki
       // go into searching state until we can generate our response
       _dVars.state = EState::Searching;
 
-      PlayEarconEnd();
-
       // see if we got a response from knowledge graph
       if (skipResponsePending)
       {
@@ -370,6 +383,11 @@ namespace Anki
       {
         // need to consume the response immediately or the system gets cranky
         ConsumeResponse();
+      }
+
+      if (_dVars.responseString.empty() || !ShouldUseCloudAudio())
+      {
+        PlayEarconEnd();
       }
 
       // did we get a response from knowledge graph?
@@ -409,7 +427,7 @@ namespace Anki
         _iVars.ttsBehavior->SetTextToSay(_dVars.responseString, callback);
 
         // let's transition into our "searching" loop
-        // since we always want to loop at least once, play the get in + loop anim before we do any logic for the tts
+        // Local TTS waits for this sequence; ready cloud audio can interrupt it in BehaviorUpdate.
         CompoundActionSequential *messageAnimation = new CompoundActionSequential();
         messageAnimation->AddAction(new TriggerLiftSafeAnimationAction(AnimationTrigger::KnowledgeGraphSearchingGetIn), true);
         messageAnimation->AddAction(new TriggerLiftSafeAnimationAction(AnimationTrigger::KnowledgeGraphSearching), true);
@@ -557,8 +575,7 @@ namespace Anki
           _dVars.cloudAudioSampleRate = sampleRate;
           _dVars.cloudAudioChannels = channels;
           PRINT_INFO("Cloud audio ready for %s (%u Hz, %u ch)", _dVars.responseId.c_str(), sampleRate, channels);
-          DelegateIfInControl(new TriggerLiftSafeAnimationAction(AnimationTrigger::KnowledgeGraphSearchingGetOutSuccess),
-                              &BehaviorKnowledgeGraphQuestion::TransitionToBeginResponse);
+          TransitionToBeginResponse();
           return;
         }
 

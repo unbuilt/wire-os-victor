@@ -57,9 +57,12 @@ class KnowledgeFollowUpRoutingTest(unittest.TestCase):
                       if "constexpr" in line and "kCloudAudio" in line)
         for signature in (
                 "void BehaviorKnowledgeGraphQuestion::BehaviorUpdate(",
+                "void BehaviorKnowledgeGraphQuestion::OnStreamingComplete(",
+                "bool BehaviorKnowledgeGraphQuestion::ShouldUseCloudAudio(",
                 "void BehaviorKnowledgeGraphQuestion::ConsumeIntentGraphResponse(",
                 "void BehaviorKnowledgeGraphQuestion::BeginResponseCloudAudio(",
                 "void BehaviorKnowledgeGraphQuestion::TransitionToSearchingLoop(",
+                "void BehaviorKnowledgeGraphQuestion::TransitionToBeginResponse(",
                 "void BehaviorKnowledgeGraphQuestion::FailCloudAudioResponse(",
                 "void BehaviorKnowledgeGraphQuestion::CancelCloudAudioPlayback(",
                 "void BehaviorKnowledgeGraphQuestion::UpdateCloudAudioStreaming("):

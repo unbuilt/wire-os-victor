@@ -59,6 +59,7 @@ message TriggerWordDetected
 {
   uint_32 streamId = 0,
   uint_32 triggerScore,
+  uint_32 bargeInPlaybackId = 0,
   uint_16 direction,
   bool isButtonPress,
   bool fromMute,

@@ -55,9 +55,13 @@ public:
   void SetPendingTriggerResponseWithGetIn(OnTriggerAudioCompleteCallback = {});
   void SetPendingTriggerResponseWithoutGetIn(OnTriggerAudioCompleteCallback = {});
 
-  // Indicates whether or not the audio stream state manager will be able to indicate to the user
-  // that streaming may be happening - if this returns false 
+  // Accepts audible responses and notification-only barge-in responses.
   bool HasValidTriggerResponse();
+
+  enum class BargeInDisposition { NotArmed, Notify, Suppress };
+  // Consuming leaves the mode armed until engine replaces the response, so a second
+  // detection cannot fall through to ordinary capture while cancellation is pending.
+  BargeInDisposition ConsumeBargeInTrigger(bool isVoice, uint32_t& playbackId);
 
   // Indicates whether voice data should be streamed to the cloud after the trigger response has indicated to
   // the user that streaming may be happening
@@ -91,6 +95,8 @@ private:
   bool _shouldTriggerWordSimulateStream;
   uint8_t _getInAnimationTag;
   std::string _getInAnimName;
+  uint32_t _bargeInPlaybackId = 0;
+  bool _bargeInConsumed = false;
   
   bool _frozenOnCharger = false;
   bool _onCharger = false;

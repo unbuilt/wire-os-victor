@@ -5,6 +5,7 @@
 #include "engine/aiComponent/behaviorComponent/behaviors/knowledgeGraph/cloudAudioPlaybackState.h"
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -25,7 +26,38 @@
 #define DEV_ASSERT(condition, ...) EXPECT_TRUE(condition)
 
 namespace Anki { namespace Vector {
+namespace AudioMetaData { namespace GameEvent {
+enum class GenericEvent { Invalid, Wake };
+}}
+enum class SDKAudioStreamingState {
+  ChunkAdded, Completed, Cancelled, PrepareFailed, PostFailed, AddAudioFailed, BufferOverflow
+};
+enum class ActionResult { SUCCESS, FAILED };
 namespace RobotInterface {
+struct SetTriggerWordResponse {
+  uint32_t bargeInPlaybackId = 0;
+  bool shouldTriggerWordStartStream = false, shouldTriggerWordSimulateStream = false;
+  std::string getInAnimationName;
+  struct { AudioMetaData::GameEvent::GenericEvent audioEvent =
+    AudioMetaData::GameEvent::GenericEvent::Invalid; } postAudioEvent;
+};
+struct TriggerWordDetected {
+  bool willOpenStream = false, fromMute = false;
+  uint32_t streamId = 0, bargeInPlaybackId = 0;
+};
+struct AudioStreamStatusEvent {
+  SDKAudioStreamingState streamResultID = SDKAudioStreamingState::ChunkAdded;
+  uint32_t playbackId = 0, audioReceived = 0, audioPlayed = 0;
+};
+enum class RobotToEngineTag { triggerWordDetected, audioStreamStatusEvent, other };
+struct RobotToEngine {
+  RobotToEngineTag tag = RobotToEngineTag::other;
+  TriggerWordDetected trigger;
+  AudioStreamStatusEvent status;
+  RobotToEngineTag GetTag() const { return tag; }
+  const TriggerWordDetected& Get_triggerWordDetected() const { return trigger; }
+  const AudioStreamStatusEvent& Get_audioStreamStatusEvent() const { return status; }
+};
 struct StartWakeWordlessStreaming {
   uint8_t streamType = 0;
   bool playGetInFromAnimProcess = false, freshCapture = false;
@@ -35,11 +67,17 @@ struct StopWakeWordlessStreaming { uint32_t streamId = 0; };
 struct EngineToRobot {
   StartWakeWordlessStreaming start;
   StopWakeWordlessStreaming stop;
-  bool stopping;
+  SetTriggerWordResponse response;
+  bool stopping = false, settingResponse = false;
   EngineToRobot(StartWakeWordlessStreaming&& s) : start(s), stopping(false) {}
   EngineToRobot(StopWakeWordlessStreaming&& s) : stop(s), stopping(true) {}
+  EngineToRobot(SetTriggerWordResponse&& s) : response(s), settingResponse(true) {}
 };
 }
+struct RobotToEngineEvent {
+  RobotInterface::RobotToEngine data;
+  const RobotInterface::RobotToEngine& GetData() const { return data; }
+};
 struct Robot {
   std::vector<RobotInterface::EngineToRobot> messages;
   void SendMessage(RobotInterface::EngineToRobot&& msg) { messages.push_back(std::move(msg)); }
@@ -49,6 +87,7 @@ struct BaseStationTimer {
   static BaseStationTimer* getInstance() { static BaseStationTimer timer; return &timer; }
   double GetCurrentTimeInSecondsDouble() const { return now; }
   float GetCurrentTimeInSeconds() const { return now; }
+  size_t GetTickCount() const { return static_cast<size_t>(now * 30); }
 };
 struct BCCompMap {};
 class UserIntentComponent;
@@ -88,7 +127,18 @@ public:
   ConversationSessionComponent* _conversation = &conversation;
   CloudMic::Message _pendingCloudIntent;
   std::list<CloudMic::Message> _cloudEvents;
-  uint32_t _expectedStreamId = 0, next = 0;
+  uint32_t _expectedStreamId = 0, _nextStreamId = 0, _captureStreamId = 0;
+  bool _captureOpen = false, _micMuted = false, triggerEnabled = true;
+  bool _pendingTrigger = false;
+  size_t _pendingTriggerTimeout = 0;
+  static constexpr size_t kMaxTicksToClear = 3, kMaxTicksToClear_Extended = 30;
+  struct TriggerWordResponseEntry {
+    std::string setID;
+    RobotInterface::SetTriggerWordResponse response;
+    TriggerWordResponseEntry(const std::string& id, RobotInterface::SetTriggerWordResponse&& r)
+    : setID(id), response(std::move(r)) {}
+  };
+  std::vector<TriggerWordResponseEntry> _responseToTriggerWordMap;
   bool _automaticListening = false, _acceptStreamResults = true, _streamResultReceived = false;
   bool _captureStateKnown = false, _isStreamOpen = false, _wasIntentError = false;
   bool _wasIntentUnclaimed = false, _pendingTriggerWillStream = false;
@@ -107,8 +157,19 @@ public:
   Json::Value pending;
   unsigned delivered = 0;
   UserIntentPtr active;
-  uint32_t AllocateStreamId() { return ++next; }
-  bool HasAnimResponseToTriggerWord() const { return false; }
+  uint32_t AllocateStreamId();
+  bool HasAnimResponseToTriggerWord() const;
+  bool IsMicMuted() const { return _micMuted; }
+  bool GetEngineShouldRespondToTriggerWord() const { return triggerEnabled; }
+  bool IsTriggerWordPending() const { return _pendingTrigger; }
+  bool CanArmWakeWordBargeIn() const;
+  void SetTriggerWordPending(bool, bool, uint32_t);
+  void PushWakeWordBargeInResponse(const std::string&, uint32_t);
+  void PushResponseToTriggerWordInternal(const std::string&, RobotInterface::SetTriggerWordResponse&&);
+  void PopResponseToTriggerWord(const std::string&);
+  void OnTriggerWord(const RobotToEngineEvent&);
+  unsigned triggerTelemetry = 0;
+  void HandleTriggerWordEventForDas(const RobotInterface::TriggerWordDetected&) { ++triggerTelemetry; }
   bool SetIntentPendingFromCloudJSONValue(Json::Value json) {
     pending = std::move(json);
     ++delivered;
@@ -126,8 +187,8 @@ public:
   void DropAnyUserIntent() { pending = {}; }
   bool IsCloudStreamOpen() const { return _isStreamOpen; }
   uint32_t GetCurrentStreamId() const { return _expectedStreamId; }
-  bool IsCaptureQuiescent(uint32_t) const { return !_isStreamOpen; }
-  bool IsCaptureOpen(uint32_t) const { return _isStreamOpen; }
+  bool IsCaptureQuiescent(uint32_t) const;
+  bool IsCaptureOpen(uint32_t) const;
   bool IsAnyUserIntentPending() const { return !pending.isNull(); }
   bool IsAnyUserIntentActive() const { return active != nullptr; }
   bool IsUserIntentActive(UserIntentTag tag) const {
@@ -137,6 +198,7 @@ public:
   UserIntentPtr GetUserIntentIfActive(UserIntentTag tag) { return tag == UserIntentTag::knowledge_response_bypass ? active : nullptr; }
   void StartFollowUpStreaming(uint32_t);
   void StartWakeWordlessStreaming(CloudMic::StreamType, bool = false);
+  void StartWakeWordBargeInStreaming();
   void StopConversationStream(uint32_t, bool = true);
   void OnCloudData(CloudMic::Message&&);
   void HandleCloudResponseAudio(const CloudMic::Message&);
@@ -153,7 +215,11 @@ public:
 };
 enum class AnimationTrigger { VC_ListeningGetOut, VC_ListeningLoop, KnowledgeGraphSearchingFailGetOut,
                               KnowledgeGraphSearching, KnowledgeGraphSearchingGetIn, KnowledgeGraphSearchingFail,
-                              KnowledgeGraphSearchingGetOutSuccess };
+                              KnowledgeGraphSearchingGetOutSuccess, KnowledgeGraphSuccessReaction };
+struct WaitAction {
+  double seconds;
+  explicit WaitAction(double seconds) : seconds(seconds) {}
+};
 struct TriggerAnimationAction { explicit TriggerAnimationAction(AnimationTrigger) {} };
 using TriggerLiftSafeAnimationAction = TriggerAnimationAction;
 struct CompoundActionSequential {
@@ -204,17 +270,23 @@ struct SDKComponent {
     EXPECT_EQ(playbackId, id);
     ++completions;
   }
-  void CancelStreamingAudio(uint32_t) { ++cancellations; }
+  uint32_t cancelledPlaybackId = 0;
+  void CancelStreamingAudio(uint32_t id) {
+    ++cancellations;
+    cancelledPlaybackId = id;
+  }
 };
 class BehaviorKnowledgeGraphQuestion {
 public:
   struct Tts {
-    unsigned requests = 0;
+    unsigned requests = 0, clears = 0;
     template<class F> void SetTextToSay(const std::string&, F) { ++requests; }
+    void ClearTextToSay() { ++clears; }
   };
   UserIntentComponent& uic;
   explicit BehaviorKnowledgeGraphQuestion(UserIntentComponent& u) : uic(u) {}
-  enum class EState { WaitingToStream, Listening, Searching, Responding, Interrupted };
+  enum class EState { WaitingToStream, Listening, Searching, Responding, Interrupted,
+                      BargeInStopping, BargeInSettling };
   enum class EResponseSource { CloudAudio, LocalTts };
   enum class EGenerationStatus { None, Success, Fail };
   struct {
@@ -230,6 +302,9 @@ public:
     CloudAudioPlaybackState cloudAudioPlayback;
     bool cloudAudioCompleteSent = false, cloudAudioResponseFinished = false;
     bool cloudAudioFailed = false;
+    bool wakeWordBargeInArmed = false;
+    uint32_t bargeInStreamId = 0;
+    double bargeInDeadline = 0, bargeInReadyTime = 0;
     double cloudAudioStreamStartTime = 0, cloudAudioLastDataTime = 0;
     double cloudAudioLastPlaybackProgressTime = 0;
     double cloudAudioCompletionDeadline = 0;
@@ -238,6 +313,7 @@ public:
   } _dVars;
   struct {
     bool cloudAudioEnabled = true;
+    bool wakeWordBargeInEnabled = true;
     bool cloudAudioFallbackToLocalTts = true;
     unsigned cloudAudioVolume = 100;
     double streamingDuration = 10, cloudAudioRequestTimeout = 65;
@@ -245,11 +321,14 @@ public:
     std::shared_ptr<Tts> ttsBehavior = std::make_shared<Tts>();
   } _iVars;
   struct {
+    unsigned cancellations = 0;
+    void CancelUtterance() { ++cancellations; }
     bool IsFinished() const { return true; }
     bool IsValid() const { return true; }
   } _readyTTSWrapper;
   struct Info : SDKComponent {
-    bool IsPickedUp() const { return false; }
+    bool pickedUp = false;
+    bool IsPickedUp() const { return pickedUp; }
     Info& GetRobotInfo() { return *this; }
     Info& GetSDKComponent() { return *this; }
   } info;
@@ -259,15 +338,31 @@ public:
   unsigned delegateCancellations = 0, delegatedTransitions = 0;
   bool cancellationAllowedCallback = false;
   bool cancelled = false;
+  std::function<void()> waitCallback;
+  double waitSeconds = 0;
+  unsigned waitDelegations = 0;
+  const std::string& GetDebugLabel() const { static const std::string label = "KG"; return label; }
   template<class T> T& GetBehaviorComp() { return uic; }
   bool IsActivated() const { return !cancelled; }
   Info& GetBEI() { return info; }
   void CancelDelegates(bool allowCallback) {
     ++delegateCancellations;
     cancellationAllowedCallback = allowCallback;
+    waitCallback = {};
   }
   bool IsControlDelegated() const { return true; }
-  void CancelSelf() { cancelled = true; }
+  void CancelSelf() { cancelled = true; waitCallback = {}; OnBehaviorDeactivated(); }
+  template<class F> void DelegateIfInControl(WaitAction* action, F callback) {
+    ++waitDelegations;
+    waitSeconds = action->seconds;
+    waitCallback = std::move(callback);
+    delete action;
+  }
+  void FireWaitCallback() {
+    auto callback = std::move(waitCallback);
+    waitCallback = {};
+    if (callback) { callback(); }
+  }
   template<class T> void DelegateIfInControl(T* action) { ++failures; delete action; }
   template<class T, class F> void DelegateIfInControl(T* action, F) {
     ++delegatedTransitions;
@@ -289,7 +384,14 @@ public:
   void CancelCloudAudioPlayback();
   void OnResponseInterrupted() {}
   void BeginResponseTTS() { ++failures; }
-  void WaitOutCloudAudioPlayback() {}
+  void WaitOutCloudAudioPlayback();
+  void OnBehaviorDeactivated();
+  void FinishCloudAudioResponse();
+  void PlaySuccessfulResponseGetOut();
+  void DisarmWakeWordBargeIn();
+  void BeginWakeWordBargeIn(uint32_t);
+  void UpdateWakeWordBargeIn();
+  void HandleWhileActivated(const RobotToEngineEvent&);
   void BeginResponseCloudAudio();
   void TransitionToSearchingLoop();
   void TransitionToBeginResponse();
@@ -657,6 +759,9 @@ TEST(KnowledgeFollowUpRouting, AcceptedAnswerSurvivesActualBehaviorReleaseAndSes
       policy.ResponseFinished(policy.Token(), Outcome::Succeeded);
       uic.active.reset();
       policy.Deactivated(2, Now());
+      uic._captureStateKnown = true;
+      uic._captureStreamId = 42;
+      uic._captureOpen = false;
       uic.conversation.UpdateDependent({});
       EXPECT_EQ(State::Settling, policy.GetState());
       ExpectRejectedAudioCleared(uic);
@@ -974,5 +1079,539 @@ TEST(KnowledgeFollowUpRouting, SearchUpdateEnforcesEstablishedStreamDeadline)
   EXPECT_TRUE(kg.cancelled);
   EXPECT_FALSE(kg.cancellationAllowedCallback);
   EXPECT_EQ(0u, kg.info.prepares);
+}
+
+using KGState = BehaviorKnowledgeGraphQuestion::EState;
+using ResponseSource = BehaviorKnowledgeGraphQuestion::EResponseSource;
+
+RobotToEngineEvent Wake(uint32_t playbackId, uint32_t streamId = 999)
+{
+  RobotToEngineEvent event;
+  event.data.tag = RobotInterface::RobotToEngineTag::triggerWordDetected;
+  event.data.trigger.bargeInPlaybackId = playbackId;
+  event.data.trigger.streamId = streamId;
+  event.data.trigger.willOpenStream = playbackId == 0;
+  return event;
+}
+
+RobotToEngineEvent Playback(uint32_t playbackId, SDKAudioStreamingState state)
+{
+  RobotToEngineEvent event;
+  event.data.tag = RobotInterface::RobotToEngineTag::audioStreamStatusEvent;
+  event.data.status.playbackId = playbackId;
+  event.data.status.streamResultID = state;
+  return event;
+}
+
+void Capture(UserIntentComponent& uic, uint32_t id, bool open)
+{
+  uic._captureStateKnown = true;
+  uic._captureStreamId = id;
+  uic._captureOpen = open;
+}
+
+void OrdinaryWakeResponse(UserIntentComponent& uic)
+{
+  RobotInterface::SetTriggerWordResponse response;
+  response.shouldTriggerWordStartStream = true;
+  response.getInAnimationName = "ordinary-get-in";
+  response.postAudioEvent.audioEvent = AudioMetaData::GameEvent::GenericEvent::Wake;
+  uic.PushResponseToTriggerWordInternal("ordinary-wake", std::move(response));
+}
+
+size_t CaptureStarts(const UserIntentComponent& uic)
+{
+  return std::count_if(uic.robot.messages.begin(), uic.robot.messages.end(),
+                      [](const RobotInterface::EngineToRobot& message) {
+                        return !message.stopping && !message.settingResponse;
+                      });
+}
+
+void StartAnswer(BehaviorKnowledgeGraphQuestion& kg)
+{
+  auto& uic = kg.uic;
+  BaseStationTimer::getInstance()->now = 100;
+  OrdinaryWakeResponse(uic);
+  uic._expectedStreamId = 42;
+  uic._nextStreamId = 42;
+  Capture(uic, 42, true);
+  uic.conversation.Policy().Claimed(1, true, true, Now());
+  kg._dVars.conversationToken = uic.conversation.Policy().Token();
+  kg._dVars.state = KGState::Responding;
+  kg._dVars.responseSource = ResponseSource::CloudAudio;
+  kg._dVars.responseId = "answer-42";
+  kg._dVars.responseString = "An answer still being synthesized.";
+  Prebuffer(uic);
+  kg.BeginResponseCloudAudio();
+  ASSERT_EQ(1u, kg.info.prepares);
+  ASSERT_GT(kg.info.sent.size(), 0u);
+  ASSERT_FALSE(kg._dVars.cloudAudioPcm.empty());
+}
+
+TEST(WakeWordBargeIn, EnabledByDefaultWithOptOutAndOnlyArmsForOrdinaryWakeResponse)
+{
+  for (int condition = 0; condition < 8; ++condition) {
+    UserIntentComponent uic;
+    BehaviorKnowledgeGraphQuestion kg(uic);
+    EXPECT_TRUE(kg._iVars.wakeWordBargeInEnabled);
+    if (condition == 0) { kg._iVars.wakeWordBargeInEnabled = false; }
+    StartAnswer(kg);
+    if (condition == 0) {
+      EXPECT_FALSE(kg._dVars.wakeWordBargeInArmed);
+      EXPECT_EQ(1u, uic._responseToTriggerWordMap.size());
+      kg.HandleWhileActivated(Wake(kg._dVars.playbackId));
+      EXPECT_EQ(KGState::Responding, kg._dVars.state);
+      EXPECT_EQ(0u, kg.info.cancellations);
+      continue;
+    }
+    ASSERT_TRUE(kg._dVars.wakeWordBargeInArmed);
+    kg.DisarmWakeWordBargeIn();
+    auto response = uic._responseToTriggerWordMap.back().response;
+    if (condition == 1) { uic._micMuted = true; }
+    if (condition == 2) { uic.triggerEnabled = false; }
+    if (condition == 3) { response.shouldTriggerWordStartStream = false; }
+    if (condition == 4) { response.shouldTriggerWordSimulateStream = true; }
+    if (condition == 5) {
+      response.postAudioEvent.audioEvent = AudioMetaData::GameEvent::GenericEvent::Invalid;
+    }
+    if (condition == 6) { uic._responseToTriggerWordMap.clear(); }
+    if (condition == 7) { response.bargeInPlaybackId = kg._dVars.playbackId + 1; }
+    if (condition >= 3 && condition != 6) {
+      uic.PushResponseToTriggerWordInternal("restrictive-top", std::move(response));
+    }
+    Prebuffer(uic);
+    kg.BeginResponseCloudAudio();
+    EXPECT_EQ(2u, kg.info.prepares);
+    EXPECT_FALSE(kg._dVars.wakeWordBargeInArmed);
+    EXPECT_FALSE(uic.CanArmWakeWordBargeIn());
+    const auto nextStreamId = uic._nextStreamId;
+    uic.StartWakeWordBargeInStreaming();
+    EXPECT_EQ(0u, CaptureStarts(uic));
+    EXPECT_FALSE(uic.IsTriggerWordPending());
+    EXPECT_EQ(nextStreamId, uic._nextStreamId);
+    EXPECT_EQ(42u, uic.GetCurrentStreamId());
+  }
+}
+
+TEST(WakeWordBargeIn, TaggedWakeBypassesPendingHandlerAndOrdinaryWakeStillRoutes)
+{
+  UserIntentComponent uic;
+  BehaviorKnowledgeGraphQuestion kg(uic);
+  kg._iVars.wakeWordBargeInEnabled = true;
+  StartAnswer(kg);
+  const auto token = uic.conversation.Policy().Token();
+  for (auto id : {kg._dVars.playbackId, kg._dVars.playbackId + 1}) {
+    uic.OnTriggerWord(Wake(id));
+    EXPECT_FALSE(uic.IsTriggerWordPending());
+    EXPECT_EQ(42u, uic.GetCurrentStreamId());
+    EXPECT_TRUE(uic.conversation.Policy().Active());
+    EXPECT_EQ(token, uic.conversation.Policy().Token());
+  }
+  EXPECT_EQ(2u, uic.triggerTelemetry);
+  kg.DisarmWakeWordBargeIn();
+  uic.OnTriggerWord(Wake(0, 77));
+  EXPECT_TRUE(uic.IsTriggerWordPending());
+  EXPECT_TRUE(uic._pendingTriggerWillStream);
+  EXPECT_EQ(77u, uic.GetCurrentStreamId());
+  EXPECT_FALSE(uic.conversation.Policy().Active());
+  EXPECT_EQ(3u, uic.triggerTelemetry);
+}
+
+TEST(WakeWordBargeIn, StopsOwnedPlaybackAndRetainsNotificationOverrideUntilBothAcks)
+{
+  for (auto ack : {SDKAudioStreamingState::Cancelled, SDKAudioStreamingState::Completed}) {
+    UserIntentComponent uic;
+    BehaviorKnowledgeGraphQuestion kg(uic);
+    kg._iVars.wakeWordBargeInEnabled = true;
+    StartAnswer(kg);
+    const auto id = kg._dVars.playbackId;
+    kg._dVars.cloudAudioCompleteSent = ack == SDKAudioStreamingState::Completed;
+    auto oldTimer = kg.waitCallback;
+    const auto bytesSent = kg.info.sent.size();
+    ASSERT_EQ(2u, uic._responseToTriggerWordMap.size());
+    const auto& response = uic._responseToTriggerWordMap.back();
+    EXPECT_EQ(kg.GetDebugLabel(), response.setID);
+    EXPECT_EQ(id, response.response.bargeInPlaybackId);
+    EXPECT_FALSE(response.response.shouldTriggerWordStartStream);
+    EXPECT_EQ(AudioMetaData::GameEvent::GenericEvent::Invalid,
+              response.response.postAudioEvent.audioEvent);
+    uic.OnTriggerWord(Wake(id));
+    kg.HandleWhileActivated(Wake(id));
+    EXPECT_EQ(KGState::BargeInStopping, kg._dVars.state);
+    EXPECT_DOUBLE_EQ(103, kg._dVars.bargeInDeadline);
+    EXPECT_DOUBLE_EQ(3, kg.waitSeconds);
+    EXPECT_EQ(1u, kg.info.cancellations);
+    EXPECT_EQ(id, kg.info.cancelledPlaybackId);
+    EXPECT_FALSE(kg.cancellationAllowedCallback);
+    EXPECT_TRUE(kg._dVars.cloudAudioResponseFinished);
+    EXPECT_TRUE(kg._dVars.cloudAudioPcm.empty());
+    EXPECT_TRUE(kg._dVars.wakeWordBargeInArmed);
+    EXPECT_FALSE(uic.conversation.Policy().Active());
+    EXPECT_STREQ("wake_word_barge_in", uic.conversation.Policy().EndReason());
+    EXPECT_TRUE(uic.robot.messages.back().stopping);
+    EXPECT_EQ(42u, uic.robot.messages.back().stop.streamId);
+    ExpectRejectedAudioCleared(uic);
+    Result(uic);
+    uic.Update();
+    EXPECT_EQ(0u, uic.delivered);
+    oldTimer();
+    kg.UpdateCloudAudioStreaming();
+    EXPECT_EQ(bytesSent, kg.info.sent.size());
+    EXPECT_EQ(0u, kg.info.completions);
+    EXPECT_DOUBLE_EQ(3, kg.waitSeconds);
+    for (int i = 0; i < 2; ++i) {
+      kg.HandleWhileActivated(Wake(id));
+      kg.HandleWhileActivated(Playback(id + 1, ack));
+    }
+    EXPECT_EQ(1u, kg.info.cancellations);
+    EXPECT_EQ(KGState::BargeInStopping, kg._dVars.state);
+    Capture(uic, 42, false);
+    BaseStationTimer::getInstance()->now = 100.5;
+    kg.BehaviorUpdate();
+    EXPECT_EQ(0u, CaptureStarts(uic));
+    kg.HandleWhileActivated(Playback(id, ack));
+    EXPECT_EQ(KGState::BargeInSettling, kg._dVars.state);
+    EXPECT_DOUBLE_EQ(100.75, kg._dVars.bargeInReadyTime);
+    EXPECT_FALSE(uic.conversation.Policy().Active());
+    EXPECT_STREQ("wake_word_barge_in", uic.conversation.Policy().EndReason());
+    EXPECT_EQ(0u, kg.delegatedTransitions);
+    uic.conversation.Policy().Deactivated(1, Now());
+    EXPECT_FALSE(uic.conversation.Policy().Open(Now() + .25));
+    BaseStationTimer::getInstance()->now = 100.749;
+    kg.BehaviorUpdate();
+    EXPECT_EQ(0u, CaptureStarts(uic));
+    kg.HandleWhileActivated(Playback(id, ack));
+    EXPECT_DOUBLE_EQ(100.75, kg._dVars.bargeInReadyTime);
+    BaseStationTimer::getInstance()->now = 100.75;
+    kg.BehaviorUpdate();
+    ASSERT_EQ(1u, CaptureStarts(uic));
+    const auto& request = uic.robot.messages.back().start;
+    EXPECT_EQ(static_cast<uint8_t>(CloudMic::StreamType::Normal), request.streamType);
+    EXPECT_TRUE(request.freshCapture);
+    EXPECT_TRUE(request.playGetInFromAnimProcess);
+    EXPECT_EQ(43u, request.streamId);
+    EXPECT_TRUE(uic.IsTriggerWordPending());
+    EXPECT_TRUE(uic._pendingTriggerWillStream);
+    EXPECT_TRUE(uic._waitingForTriggerWordGetInToFinish);
+    EXPECT_FALSE(uic._automaticListening);
+    EXPECT_TRUE(uic._acceptStreamResults);
+    EXPECT_FALSE(uic._captureStateKnown);
+    EXPECT_EQ(1u, uic._responseToTriggerWordMap.size());
+    EXPECT_EQ("ordinary-wake", uic._responseToTriggerWordMap.back().setID);
+    EXPECT_TRUE(kg.cancelled);
+    EXPECT_FALSE(kg._dVars.wakeWordBargeInArmed);
+    EXPECT_FALSE(kg.waitCallback);
+    EXPECT_EQ(1u, kg.info.cancellations);
+    EXPECT_EQ(0u, kg.failures);
+    EXPECT_EQ(0u, kg.delegatedTransitions);
+    kg.HandleWhileActivated(Wake(id));
+    kg.HandleWhileActivated(Playback(id, ack));
+    kg.BehaviorUpdate();
+    EXPECT_EQ(1u, CaptureStarts(uic));
+    AudioStart(uic, 42, "retired-answer");
+    Result(uic, Params(), "intent_knowledge_response_extend", 42);
+    uic.Update();
+    EXPECT_EQ(0u, uic.delivered);
+    EXPECT_FALSE(uic._cloudAudio.haveStart);
+    Result(uic, Params(), "intent_knowledge_response_extend", 43);
+    uic.Update();
+    EXPECT_EQ(1u, uic.delivered);
+    EXPECT_EQ("intent_knowledge_response_extend", uic.pending["intent"].asString());
+  }
+}
+
+TEST(WakeWordBargeIn, RendererAckCannotSubstituteForOwnedCaptureClosedAck)
+{
+  for (int captureState = 0; captureState < 3; ++captureState) {
+    UserIntentComponent uic;
+    BehaviorKnowledgeGraphQuestion kg(uic);
+    kg._iVars.wakeWordBargeInEnabled = true;
+    StartAnswer(kg);
+    kg.HandleWhileActivated(Wake(kg._dVars.playbackId));
+    kg.HandleWhileActivated(Playback(kg._dVars.playbackId, SDKAudioStreamingState::Cancelled));
+    BaseStationTimer::getInstance()->now = 100.25;
+    if (captureState == 0) { uic._captureStateKnown = false; }
+    if (captureState == 1) { Capture(uic, 41, false); }
+    if (captureState == 2) { Capture(uic, 42, true); }
+    EXPECT_FALSE(uic._isStreamOpen); // A transport stop is not a capture acknowledgement.
+    kg.BehaviorUpdate();
+    EXPECT_EQ(0u, CaptureStarts(uic));
+    EXPECT_FALSE(kg.cancelled);
+    Capture(uic, 42, false);
+    kg.BehaviorUpdate();
+    EXPECT_EQ(1u, CaptureStarts(uic));
+    EXPECT_TRUE(kg.cancelled);
+  }
+}
+
+TEST(WakeWordBargeIn, InvalidWakeOrUnsafeAnswerCannotBeginInterruption)
+{
+  for (int condition = 0; condition < 13; ++condition) {
+    UserIntentComponent uic;
+    BehaviorKnowledgeGraphQuestion kg(uic);
+    kg._iVars.wakeWordBargeInEnabled = true;
+    StartAnswer(kg);
+    auto id = kg._dVars.playbackId;
+    if (condition == 0) { id = 0; }
+    if (condition == 1) { ++id; }
+    if (condition == 2) { kg._iVars.wakeWordBargeInEnabled = false; }
+    if (condition == 3) { kg.DisarmWakeWordBargeIn(); }
+    if (condition == 4) { kg._dVars.state = KGState::Searching; }
+    if (condition == 5) { kg._dVars.cloudAudioResponseFinished = true; }
+    if (condition == 6) { kg._dVars.responseSource = ResponseSource::LocalTts; }
+    if (condition == 7) { uic._micMuted = true; }
+    if (condition == 8) { uic.triggerEnabled = false; }
+    if (condition == 9) { kg.info.pickedUp = true; }
+    if (condition == 10) { uic._pendingTrigger = true; }
+    if (condition == 11) { uic.pending["intent"] = "unmatched_intent"; }
+    if (condition == 12) { uic._expectedStreamId = 43; }
+    kg.HandleWhileActivated(Wake(id));
+    EXPECT_NE(KGState::BargeInStopping, kg._dVars.state) << condition;
+    EXPECT_EQ(0u, kg.info.cancellations) << condition;
+    EXPECT_EQ(0u, CaptureStarts(uic));
+    EXPECT_TRUE(uic.conversation.Policy().Active());
+  }
+}
+
+TEST(WakeWordBargeIn, StreamSupersedingArmedAnswerBeforeWakeRetainsItsCaptureAndAudio)
+{
+  UserIntentComponent uic;
+  BehaviorKnowledgeGraphQuestion kg(uic);
+  kg._iVars.wakeWordBargeInEnabled = true;
+  StartAnswer(kg);
+  ASSERT_TRUE(kg._dVars.wakeWordBargeInArmed);
+  ASSERT_EQ(42u, kg._dVars.bargeInStreamId);
+  const auto playbackId = kg._dVars.playbackId;
+  uic.StartWakeWordlessStreaming(CloudMic::StreamType::Normal);
+  ASSERT_EQ(43u, uic.GetCurrentStreamId());
+  Capture(uic, 43, true);
+  Prebuffer(uic, 43, "new-command-answer");
+  const auto messages = uic.robot.messages.size();
+  uic.OnTriggerWord(Wake(playbackId));
+  kg.HandleWhileActivated(Wake(playbackId));
+  EXPECT_EQ(KGState::Responding, kg._dVars.state);
+  EXPECT_EQ(42u, kg._dVars.bargeInStreamId);
+  EXPECT_EQ(43u, uic.GetCurrentStreamId());
+  EXPECT_TRUE(uic.IsCaptureOpen(43));
+  EXPECT_FALSE(uic.IsTriggerWordPending());
+  EXPECT_TRUE(uic._acceptStreamResults);
+  EXPECT_EQ("new-command-answer", uic._cloudAudioExpectedId);
+  EXPECT_EQ(kCloudAudioMaxBytes, uic._cloudAudio.pcm.size());
+  EXPECT_EQ(messages, uic.robot.messages.size());
+  EXPECT_EQ(0u, kg.info.cancellations);
+  EXPECT_EQ(0u, kg.delegateCancellations);
+  EXPECT_FALSE(kg.cancelled);
+}
+
+TEST(WakeWordBargeIn, UnsafeOrSupersededStopAndSettleAbortWithoutNewCapture)
+{
+  for (bool settled : {false, true}) {
+    for (int condition = 0; condition < 7; ++condition) {
+      UserIntentComponent uic;
+      BehaviorKnowledgeGraphQuestion kg(uic);
+      kg._iVars.wakeWordBargeInEnabled = true;
+      StartAnswer(kg);
+      kg.HandleWhileActivated(Wake(kg._dVars.playbackId));
+      Capture(uic, 42, false);
+      if (settled) {
+        kg.HandleWhileActivated(Playback(kg._dVars.playbackId, SDKAudioStreamingState::Cancelled));
+      }
+      BaseStationTimer::getInstance()->now = condition == 6 ? 103 : 100.25;
+      if (condition == 0) { uic._micMuted = true; }
+      if (condition == 1) { uic.triggerEnabled = false; }
+      if (condition == 2) { kg.info.pickedUp = true; }
+      if (condition == 3) { uic._pendingTrigger = true; }
+      if (condition == 4) { uic.pending["intent"] = "unmatched_intent"; }
+      if (condition == 5) {
+        uic.StartWakeWordlessStreaming(CloudMic::StreamType::Normal);
+        Prebuffer(uic, 43, "new-owner-answer");
+      }
+      const auto messages = uic.robot.messages.size();
+      const auto starts = CaptureStarts(uic);
+      kg.BehaviorUpdate();
+      EXPECT_TRUE(kg.cancelled) << condition;
+      EXPECT_FALSE(kg._dVars.wakeWordBargeInArmed);
+      EXPECT_FALSE(kg.cancellationAllowedCallback);
+      EXPECT_FALSE(kg.waitCallback);
+      EXPECT_EQ(starts, CaptureStarts(uic));
+      EXPECT_EQ(messages + 1, uic.robot.messages.size()); // Only restore the ordinary wake response.
+      EXPECT_EQ(1u, kg.info.cancellations);
+      EXPECT_EQ(0u, kg.failures);
+      EXPECT_FALSE(uic.conversation.Policy().Active());
+      if (condition == 5) {
+        EXPECT_EQ(43u, uic.GetCurrentStreamId());
+        EXPECT_TRUE(uic._acceptStreamResults);
+        EXPECT_EQ("new-owner-answer", uic._cloudAudioExpectedId);
+        EXPECT_EQ(kCloudAudioMaxBytes, uic._cloudAudio.pcm.size());
+      }
+    }
+  }
+}
+
+TEST(WakeWordBargeIn, RendererErrorsNeverAuthorizeCaptureAndStopWatchdogDisarms)
+{
+  for (auto state : {SDKAudioStreamingState::PrepareFailed, SDKAudioStreamingState::PostFailed,
+                     SDKAudioStreamingState::AddAudioFailed, SDKAudioStreamingState::BufferOverflow,
+                     SDKAudioStreamingState::ChunkAdded}) {
+    UserIntentComponent uic;
+    BehaviorKnowledgeGraphQuestion kg(uic);
+    kg._iVars.wakeWordBargeInEnabled = true;
+    StartAnswer(kg);
+    kg.HandleWhileActivated(Wake(kg._dVars.playbackId));
+    Capture(uic, 42, false);
+    kg.HandleWhileActivated(Playback(kg._dVars.playbackId, state));
+    BaseStationTimer::getInstance()->now = 102.999;
+    kg.BehaviorUpdate();
+    EXPECT_EQ(KGState::BargeInStopping, kg._dVars.state);
+    EXPECT_EQ(0u, CaptureStarts(uic));
+    EXPECT_FALSE(kg.cancelled);
+    BaseStationTimer::getInstance()->now = 103;
+    kg.FireWaitCallback();
+    EXPECT_TRUE(kg.cancelled);
+    EXPECT_FALSE(kg._dVars.wakeWordBargeInArmed);
+    EXPECT_EQ(1u, uic._responseToTriggerWordMap.size());
+    EXPECT_EQ(0u, CaptureStarts(uic));
+    EXPECT_EQ(0u, kg.failures);
+    EXPECT_EQ(1u, kg.info.cancellations);
+  }
+}
+
+TEST(WakeWordBargeIn, CancellationFailureFinishAndDeactivationDisarmIdempotently)
+{
+  for (int path = 0; path < 5; ++path) {
+    UserIntentComponent uic;
+    BehaviorKnowledgeGraphQuestion kg(uic);
+    kg._iVars.wakeWordBargeInEnabled = true;
+    StartAnswer(kg);
+    if (path == 0) { kg.CancelCloudAudioPlayback(); }
+    if (path == 1) { kg.FailCloudAudioResponse(); }
+    if (path == 2) { kg.FinishCloudAudioResponse(); }
+    if (path == 3) { kg.FailCloudAudioResponse(true); }
+    if (path == 4) { uic._micMuted = true; kg.OnBehaviorDeactivated(); }
+    EXPECT_FALSE(kg._dVars.wakeWordBargeInArmed);
+    ASSERT_EQ(1u, uic._responseToTriggerWordMap.size());
+    EXPECT_EQ("ordinary-wake", uic._responseToTriggerWordMap.back().setID);
+    const auto messages = uic.robot.messages.size();
+    kg.DisarmWakeWordBargeIn();
+    EXPECT_EQ(messages, uic.robot.messages.size());
+    kg.HandleWhileActivated(Wake(kg._dVars.playbackId));
+    EXPECT_NE(KGState::BargeInStopping, kg._dVars.state);
+    EXPECT_EQ(0u, CaptureStarts(uic));
+    if (path == 4) {
+      EXPECT_EQ(1u, kg._readyTTSWrapper.cancellations);
+      EXPECT_EQ(1u, kg._iVars.ttsBehavior->clears);
+      EXPECT_EQ(1u, kg.info.cancellations);
+    }
+  }
+}
+
+TEST(WakeWordBargeIn, DeactivationDuringStopOrSettleDoesNotReopenOrCancelRendererTwice)
+{
+  for (bool settled : {false, true}) {
+    UserIntentComponent uic;
+    BehaviorKnowledgeGraphQuestion kg(uic);
+    kg._iVars.wakeWordBargeInEnabled = true;
+    StartAnswer(kg);
+    kg.HandleWhileActivated(Wake(kg._dVars.playbackId));
+    if (settled) {
+      kg.HandleWhileActivated(Playback(kg._dVars.playbackId, SDKAudioStreamingState::Cancelled));
+    }
+    kg.CancelSelf();
+    Capture(uic, 42, false);
+    BaseStationTimer::getInstance()->now = 100.25;
+    kg.HandleWhileActivated(Playback(kg._dVars.playbackId, SDKAudioStreamingState::Cancelled));
+    kg.BehaviorUpdate();
+    EXPECT_EQ(0u, CaptureStarts(uic));
+    EXPECT_EQ(1u, kg.info.cancellations);
+    EXPECT_FALSE(kg._dVars.wakeWordBargeInArmed);
+    EXPECT_FALSE(kg.waitCallback);
+  }
+}
+
+TEST(WakeWordBargeIn, ActualRendererCompletionAndErrorsDisarmBeforeFurtherWake)
+{
+  for (auto state : {SDKAudioStreamingState::Completed, SDKAudioStreamingState::PrepareFailed,
+                     SDKAudioStreamingState::PostFailed, SDKAudioStreamingState::AddAudioFailed,
+                     SDKAudioStreamingState::BufferOverflow}) {
+    UserIntentComponent uic;
+    BehaviorKnowledgeGraphQuestion kg(uic);
+    kg._iVars.wakeWordBargeInEnabled = true;
+    StartAnswer(kg);
+    const auto id = kg._dVars.playbackId;
+    kg._dVars.cloudAudioCompleteSent = true;
+    kg.HandleWhileActivated(Playback(id + 1, state));
+    EXPECT_TRUE(kg._dVars.wakeWordBargeInArmed);
+    kg.HandleWhileActivated(Playback(id, state));
+    EXPECT_FALSE(kg._dVars.wakeWordBargeInArmed);
+    EXPECT_FALSE(kg.cancellationAllowedCallback);
+    kg.HandleWhileActivated(Wake(id));
+    EXPECT_NE(KGState::BargeInStopping, kg._dVars.state);
+    EXPECT_EQ(0u, CaptureStarts(uic));
+  }
+}
+
+TEST(WakeWordBargeIn, DisarmingDoesNotPopAnotherResponseOwnersOverride)
+{
+  UserIntentComponent uic;
+  BehaviorKnowledgeGraphQuestion kg(uic);
+  kg._iVars.wakeWordBargeInEnabled = true;
+  StartAnswer(kg);
+  RobotInterface::SetTriggerWordResponse response;
+  response.bargeInPlaybackId = kg._dVars.playbackId + 1;
+  uic.PushResponseToTriggerWordInternal("new-owner", std::move(response));
+  const auto messages = uic.robot.messages.size();
+  kg.DisarmWakeWordBargeIn();
+  ASSERT_EQ(2u, uic._responseToTriggerWordMap.size());
+  EXPECT_EQ("new-owner", uic._responseToTriggerWordMap.back().setID);
+  EXPECT_EQ(messages, uic.robot.messages.size());
+  EXPECT_FALSE(uic.CanArmWakeWordBargeIn());
+}
+
+TEST(WakeWordBargeIn, LateCloudChunksCompletionAndErrorsCannotResumeInterruptedAnswer)
+{
+  for (bool settled : {false, true}) {
+    UserIntentComponent uic;
+    BehaviorKnowledgeGraphQuestion kg(uic);
+    kg._iVars.wakeWordBargeInEnabled = true;
+    StartAnswer(kg);
+    kg.HandleWhileActivated(Wake(kg._dVars.playbackId));
+    if (settled) {
+      kg.HandleWhileActivated(Playback(kg._dVars.playbackId, SDKAudioStreamingState::Cancelled));
+    }
+    const auto sent = kg.info.sent.size();
+    const auto waits = kg.waitDelegations;
+    AudioStart(uic, 42, "answer-42");
+    CloudMic::ResponseAudioChunk chunk;
+    chunk.streamId = 42;
+    chunk.responseId = "answer-42";
+    chunk.data.assign(32000, 0x7a);
+    uic.OnCloudData(CloudMic::Message(std::move(chunk)));
+    CloudMic::ResponseAudioEnd end;
+    end.streamId = 42;
+    end.responseId = "answer-42";
+    end.finalSequenceNumber = 1;
+    uic.OnCloudData(CloudMic::Message(std::move(end)));
+    CloudMic::ResponseAudioError error;
+    error.streamId = 42;
+    error.responseId = "answer-42";
+    error.error = CloudMic::ResponseAudioErrorType::Provider;
+    uic.OnCloudData(CloudMic::Message(std::move(error)));
+    uic.Update();
+    kg.BehaviorUpdate();
+    kg.UpdateCloudAudioStreaming();
+    kg.WaitOutCloudAudioPlayback();
+    EXPECT_EQ(sent, kg.info.sent.size());
+    EXPECT_EQ(waits, kg.waitDelegations);
+    EXPECT_EQ(0u, kg.info.completions);
+    EXPECT_EQ(1u, kg.info.cancellations);
+    EXPECT_EQ(0u, kg.failures);
+    EXPECT_EQ(0u, kg.delegatedTransitions);
+    EXPECT_EQ(0u, CaptureStarts(uic));
+    EXPECT_TRUE(kg._dVars.cloudAudioPcm.empty());
+    EXPECT_TRUE(uic._cloudAudio.pcm.empty());
+    EXPECT_FALSE(uic.HasCloudAudioError("answer-42"));
+    EXPECT_FALSE(uic.IsCloudAudioComplete("answer-42"));
+    EXPECT_FALSE(uic.conversation.Policy().Active());
+  }
 }
 }}

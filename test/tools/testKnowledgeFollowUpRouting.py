@@ -1,4 +1,5 @@
 """Exercise production UIC request/result/audio paths with recording services."""
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -17,6 +18,13 @@ class KnowledgeFollowUpRoutingTest(unittest.TestCase):
         for signature in (
                 "void UserIntentComponent::StartFollowUpStreaming(",
                 "void UserIntentComponent::StartWakeWordlessStreaming(",
+                "void UserIntentComponent::StartWakeWordBargeInStreaming(",
+                "void UserIntentComponent::SetTriggerWordPending(",
+                "void UserIntentComponent::PushWakeWordBargeInResponse(",
+                "void UserIntentComponent::PushResponseToTriggerWordInternal(",
+                "void UserIntentComponent::PopResponseToTriggerWord(",
+                "bool UserIntentComponent::CanArmWakeWordBargeIn(",
+                "bool UserIntentComponent::HasAnimResponseToTriggerWord(",
                 "void UserIntentComponent::StopConversationStream(",
                 "void UserIntentComponent::OnCloudData(",
                 "void UserIntentComponent::HandleCloudResponseAudio(",
@@ -32,6 +40,15 @@ class KnowledgeFollowUpRoutingTest(unittest.TestCase):
             start = source.index(signature)
             body = source.index("{", start)
             bodies.append(source[start:body] + function_body(source, signature))
+        bodies.append("void UserIntentComponent::OnTriggerWord(const RobotToEngineEvent& event)\n" +
+                      function_body(source, "auto triggerWordCallback ="))
+        header = (ROOT / "engine/aiComponent/behaviorComponent/userIntentComponent.h").read_text()
+        for result, signature in (
+                ("bool", "IsCaptureQuiescent(uint32_t streamId) const"),
+                ("bool", "IsCaptureOpen(uint32_t streamId) const"),
+                ("uint32_t", "AllocateStreamId()")):
+            bodies.append(result + " UserIntentComponent::" + signature + "\n" +
+                          function_body(header, result + " " + signature))
         update = function_body(source, "void UserIntentComponent::UpdateDependent(")
         bodies.append("void UserIntentComponent::Update()\n" +
                       update[:update.index("  const size_t currTick")] + "\n}")
@@ -53,6 +70,13 @@ class KnowledgeFollowUpRoutingTest(unittest.TestCase):
             bodies.append(followup[start:body] + function_body(followup, signature))
         kg = (ROOT / "engine/aiComponent/behaviorComponent/behaviors/knowledgeGraph/"
               "behaviorKnowledgeGraphQuestion.cpp").read_text()
+        kg_header = (ROOT / "engine/aiComponent/behaviorComponent/behaviors/knowledgeGraph/"
+                     "behaviorKnowledgeGraphQuestion.h").read_text()
+        self.assertRegex(kg_header, r"bool\s+wakeWordBargeInEnabled\s*=\s*true\s*;")
+        config = json.loads((ROOT / "resources/config/engine/behaviorComponent/behaviors/"
+                             "victorBehaviorTree/highLevelDelegates/knowledgeGraph/"
+                             "knowledgeGraphQuestion.json").read_text())
+        self.assertIs(config["wakeWordBargeInEnabled"], True)
         bodies.extend(line for line in kg.splitlines()
                       if "constexpr" in line and "kCloudAudio" in line)
         for signature in (
@@ -65,6 +89,14 @@ class KnowledgeFollowUpRoutingTest(unittest.TestCase):
                 "void BehaviorKnowledgeGraphQuestion::TransitionToBeginResponse(",
                 "void BehaviorKnowledgeGraphQuestion::FailCloudAudioResponse(",
                 "void BehaviorKnowledgeGraphQuestion::CancelCloudAudioPlayback(",
+                "void BehaviorKnowledgeGraphQuestion::FinishCloudAudioResponse(",
+                "void BehaviorKnowledgeGraphQuestion::PlaySuccessfulResponseGetOut(",
+                "void BehaviorKnowledgeGraphQuestion::WaitOutCloudAudioPlayback(",
+                "void BehaviorKnowledgeGraphQuestion::OnBehaviorDeactivated(",
+                "void BehaviorKnowledgeGraphQuestion::DisarmWakeWordBargeIn(",
+                "void BehaviorKnowledgeGraphQuestion::BeginWakeWordBargeIn(",
+                "void BehaviorKnowledgeGraphQuestion::UpdateWakeWordBargeIn(",
+                "void BehaviorKnowledgeGraphQuestion::HandleWhileActivated(const RobotToEngineEvent",
                 "void BehaviorKnowledgeGraphQuestion::UpdateCloudAudioStreaming("):
             start = kg.index(signature)
             body = kg.index("{", start)

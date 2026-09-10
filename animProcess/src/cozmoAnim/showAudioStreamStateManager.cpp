@@ -67,6 +67,10 @@ void ShowAudioStreamStateManager::Update()
 void ShowAudioStreamStateManager::SetTriggerWordResponse(const RobotInterface::SetTriggerWordResponse& msg)
 {
   std::lock_guard<std::recursive_mutex> lock(_triggerResponseMutex);
+  if (_bargeInPlaybackId != msg.bargeInPlaybackId) {
+    _bargeInConsumed = false;
+  }
+  _bargeInPlaybackId = msg.bargeInPlaybackId;
   _postAudioEvent = msg.postAudioEvent;
   _minStreamingDuration_ms = msg.minStreamingDuration_ms;
   _shouldTriggerWordStartStream = msg.shouldTriggerWordStartStream;
@@ -104,7 +108,7 @@ void ShowAudioStreamStateManager::SetPendingTriggerResponseWithoutGetIn(OnTrigge
 
 void ShowAudioStreamStateManager::StartTriggerResponseWithGetIn(OnTriggerAudioCompleteCallback callback)
 {
-  if(!HasValidTriggerResponse()){
+  if(_bargeInPlaybackId != 0 || !HasValidTriggerResponse()){
     if(callback){
       callback(false);
     }
@@ -126,7 +130,7 @@ void ShowAudioStreamStateManager::StartTriggerResponseWithoutGetIn(OnTriggerAudi
 {
   using namespace AudioEngine;
 
-  if(!HasValidTriggerResponse()){
+  if(_bargeInPlaybackId != 0 || !HasValidTriggerResponse()){
     if(callback){
       callback(false);
     }
@@ -172,20 +176,37 @@ void ShowAudioStreamStateManager::StartTriggerResponseWithoutGetIn(OnTriggerAudi
 bool ShowAudioStreamStateManager::HasValidTriggerResponse()
 {
   std::lock_guard<std::recursive_mutex> lock(_triggerResponseMutex);
-  return _postAudioEvent.audioEvent != AudioMetaData::GameEvent::GenericEvent::Invalid;
+  return _bargeInPlaybackId != 0 ||
+         _postAudioEvent.audioEvent != AudioMetaData::GameEvent::GenericEvent::Invalid;
+}
+
+ShowAudioStreamStateManager::BargeInDisposition
+ShowAudioStreamStateManager::ConsumeBargeInTrigger(bool isVoice, uint32_t& playbackId)
+{
+  std::lock_guard<std::recursive_mutex> lock(_triggerResponseMutex);
+  playbackId = 0;
+  if (_bargeInPlaybackId == 0) {
+    return BargeInDisposition::NotArmed;
+  }
+  if (!isVoice || _bargeInConsumed) {
+    return BargeInDisposition::Suppress;
+  }
+  _bargeInConsumed = true;
+  playbackId = _bargeInPlaybackId;
+  return BargeInDisposition::Notify;
 }
 
 
 bool ShowAudioStreamStateManager::ShouldStreamAfterTriggerWordResponse()
 {
   std::lock_guard<std::recursive_mutex> lock(_triggerResponseMutex);
-  return HasValidTriggerResponse() && _shouldTriggerWordStartStream;
+  return _bargeInPlaybackId == 0 && HasValidTriggerResponse() && _shouldTriggerWordStartStream;
 }
 
 bool ShowAudioStreamStateManager::ShouldSimulateStreamAfterTriggerWord()
 {
   std::lock_guard<std::recursive_mutex> lock(_triggerResponseMutex);
-  return HasValidTriggerResponse() && _shouldTriggerWordSimulateStream;
+  return _bargeInPlaybackId == 0 && HasValidTriggerResponse() && _shouldTriggerWordSimulateStream;
 }
 
 void ShowAudioStreamStateManager::SetAlexaUXResponses(const RobotInterface::SetAlexaUXResponses& msg)

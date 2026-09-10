@@ -47,8 +47,9 @@ type Process struct {
 	opts      options
 	// writeMu serializes writeResponse so the cloud-audio goroutine and the main
 	// process loop don't interleave datagram writes to the engine socket.
-	writeMu    sync.Mutex
-	audioOwner cloudAudioOwner
+	writeMu     sync.Mutex
+	audioOwner  cloudAudioOwner
+	audioCancel context.CancelFunc
 }
 
 // AddReceiver adds the given Receiver to the list of sources the

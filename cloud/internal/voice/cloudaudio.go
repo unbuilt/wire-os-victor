@@ -2,6 +2,7 @@ package voice
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -123,13 +124,18 @@ type kgResponseParams struct {
 type cloudAudioOwner struct {
 	streamID   uint32
 	generation uint64
+	ctx        context.Context
 }
 
 func (p *Process) beginAudioOwner(streamID uint32) {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
+	if p.audioCancel != nil {
+		p.audioCancel()
+	}
 	p.audioOwner.generation++
 	p.audioOwner.streamID = streamID
+	p.audioOwner.ctx, p.audioCancel = context.WithCancel(context.Background())
 }
 
 func (p *Process) cancelAudioOwner(streamID uint32) {
@@ -137,6 +143,14 @@ func (p *Process) cancelAudioOwner(streamID uint32) {
 	defer p.writeMu.Unlock()
 	if p.audioOwner.streamID == streamID {
 		p.audioOwner.generation++
+		p.initAudioContextLocked()
+		p.audioCancel()
+	}
+}
+
+func (p *Process) initAudioContextLocked() {
+	if p.audioOwner.ctx == nil {
+		p.audioOwner.ctx, p.audioCancel = context.WithCancel(context.Background())
 	}
 }
 
@@ -146,6 +160,9 @@ func (p *Process) getAudioOwner(owners []cloudAudioOwner) cloudAudioOwner {
 	}
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
+	// Capture the context before scheduling a worker, including legacy callers
+	// that use a zero-value Process without opening an ASR stream first.
+	p.initAudioContextLocked()
 	return p.audioOwner
 }
 
@@ -154,7 +171,7 @@ func (p *Process) getAudioOwner(owners []cloudAudioOwner) cloudAudioOwner {
 func (p *Process) writeCloudAudio(response *cloud.Message, owner cloudAudioOwner) {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
-	if owner != p.audioOwner {
+	if owner != p.audioOwner || (owner.ctx != nil && owner.ctx.Err() != nil) {
 		return
 	}
 	switch response.Tag() {
@@ -204,7 +221,7 @@ func (p *Process) maybeSendCloudAudio(result *cloud.IntentResult) {
 func (p *Process) sendCloudAudio(endpoint, responseID, audioID, text string, owners ...cloudAudioOwner) {
 	owner := p.getAudioOwner(owners)
 	log.Printf("Cloud audio: starting fetch for %s (audio_id_present=%t)\n", responseID, audioID != "")
-	body, err := openCloudAudio(endpoint, audioID, text)
+	body, err := openCloudAudio(owner.ctx, endpoint, audioID, text)
 	if err != nil {
 		log.Println("Cloud audio: fetch failed:", err)
 		p.sendCloudAudioError(responseID, err, owner)
@@ -331,13 +348,13 @@ func (p *Process) sendCloudAudioError(responseID string, err error, owners ...cl
 //
 // Handle requests negotiate framed outcomes, decoded here into incremental
 // 16 kHz mono s16le PCM. Older servers and generic POSTs still use raw PCM.
-func openCloudAudio(endpoint, audioID, text string) (io.ReadCloser, error) {
+func openCloudAudio(ctx context.Context, endpoint, audioID, text string) (io.ReadCloser, error) {
 	client := &http.Client{Timeout: cloudAudioTimeout}
 
 	var req *http.Request
 	var err error
 	if audioID != "" {
-		req, err = http.NewRequest(http.MethodGet, joinAudioURL(endpoint, audioID), nil)
+		req, err = http.NewRequestWithContext(ctx, http.MethodGet, joinAudioURL(endpoint, audioID), nil)
 		if err != nil {
 			return nil, err
 		}
@@ -351,7 +368,7 @@ func openCloudAudio(endpoint, audioID, text string) (io.ReadCloser, error) {
 		if jsonErr != nil {
 			return nil, jsonErr
 		}
-		req, err = http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(reqBody))
+		req, err = http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(reqBody))
 		if err != nil {
 			return nil, err
 		}

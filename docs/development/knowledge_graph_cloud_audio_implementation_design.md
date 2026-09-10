@@ -1221,3 +1221,75 @@ or bypass response, so a valid cloud answer starts without this extra chime.
 Local-only/disabled-cloud responses and missing answers retain the earcon;
 wake and listening-start cues are unchanged. Later cloud failure retains the
 existing fallback policy without inserting a delayed acknowledgement.
+
+## Wake-word interruption
+
+`wakeWordBargeInEnabled` in `knowledgeGraphQuestion.json` enables coordinated
+wake-word interruption during cloud-answer playback. It defaults to `true`,
+including when omitted and in the packaged behavior configuration.
+Set it to `false` to opt out and restore the prior playback behavior.
+Picovoice remains the wake backend. This does not enable adaptive AEC or change
+`ANKI_AEC_EXPERIMENT=reference`.
+
+During a cloud answer, say the wake word, wait for the listening cue/indicator,
+then give the new command. Words spoken immediately after the wake word while
+the old answer is stopping are deliberately not retained. This is interruptible
+half-duplex, not simultaneous ASR of speech over the answer. The new request is
+`Normal` / IntentGraph, not an automatic KnowledgeGraph follow-up, so it can
+also be a non-question command.
+
+The implementation uses the existing trigger-response stack and capture
+protocol, with playback-tagged notification-only wake responses:
+
+1. The KG renderer arms a notification-only response for its playback ID.
+   Animator emits at most one tagged wake notification for that ID, without
+   starting an earcon, get-in animation, or microphone stream. This is voice
+   only: a button press does not create a replacement capture through this
+   override; existing touch interruption remains separate.
+2. KG accepts only its current, armed playback while responding. It ends the
+   current conversation, suppresses delegated callbacks, cancels the renderer,
+   clears buffered PCM, and stops the old stream. UIC rejects old stream
+   results; vic-cloud invalidates the owner and cancels its HTTP download.
+3. KG waits for the matching renderer `Cancelled` (or an already-completing
+   `Completed`) acknowledgement, then at least 250 ms of settling. It also
+   requires the old capture's closed acknowledgement. Repeated notifications
+   and stale playback IDs cannot restart capture.
+4. It removes only its own trigger override and requests a fresh ordinary wake
+   command, using the existing listening get-in/earcon. Capture begins after
+   the earcon and uses the existing sequence/time fence with zero pre-roll,
+   excluding queued old answer audio. Normal wake-intent dispatch takes over.
+
+Mute, engine wake locks, pickup, superseding capture, behavior deactivation,
+or a three-second stop/settle timeout abort the handoff without opening a
+replacement capture. Playback completion, local fallback, failure and
+deactivation remove the override. Local-TTS playback and the ready/search
+phases are outside this feature. Automatic follow-up remains independent.
+
+**Acoustic limitation:** reference mode supplies a reference but does not cancel
+speaker echo. Picovoice can miss a user's wake during loud playback or detect
+the robot saying its own wake phrase. Playback identity and one-shot delivery
+prevent stale/repeated protocol handoffs; they do **not** identify the speaker
+or reject acoustic self-wakes. There is no new Picovoice playback-reference
+recognizer or claim of echo-safe duplex here. Default-on does not remove the
+need for robot acceptance, including answers containing the wake phrase,
+different volumes/distances, mute/pickup and repeated interruptions. The
+configuration opt-out remains available if acoustic self-wakes are a problem.
+
+The engine/animator CLAD message layout changes require matching firmware
+components; do not deploy just one process from this revision. No Lycopod
+changes are required. OTA builds must include the matching engine, animator
+and cloud worker; building an image does not install it on the robot.
+
+Host regressions (from `anki/victor`, after normal CLAD generation):
+
+```sh
+PYTHONPATH=test/tools python3 -m unittest \
+  testKnowledgeFollowUpRouting testWakeWordBargeIn testFollowUpTiming testMicMessageDispatch
+```
+
+These exercise production trigger/response and KG/UIC function bodies, message
+round trips, cancellation/settle ordering, ownership, repeat wakes, quiet/muted
+responses and fresh-capture fences. The Go voice tests additionally exercise
+HTTP cancellation while waiting for headers or a raw/framed body, including
+legacy stream ID zero and an already-closed ASR stream. Software regressions
+and ARM compilation do not establish acoustic performance in reference mode.

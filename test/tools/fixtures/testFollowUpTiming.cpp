@@ -1,5 +1,6 @@
 #include "gtest/gtest.h"
 #include "engine/aiComponent/behaviorComponent/conversationSessionState.h"
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -58,6 +59,7 @@ class MicDataSystem;
 struct Processor {
   MicDataSystem* system;
   void CreateStreamJob(CloudMic::StreamType, int, uint32_t, bool);
+  std::function<void()> beforeCreateStreamJob;
 };
 class MicDataSystem {
 public:
@@ -79,7 +81,8 @@ public:
   void SendUdpMessage(int message) { messages.push_back(message); }
   void EarconDone() { context.response.callback(true); }
   bool lights = false, muted = false;
-  bool _wakeWordlessPending = false, _currentlyStreaming = false, _streamingComplete = false;
+  std::atomic<bool> _wakeWordlessPending{false};
+  bool _currentlyStreaming = false, _streamingComplete = false;
   uint32_t _pendingStreamId = 0, _wakeWordlessGeneration = 0;
   size_t _streamingAudioIndex = 0;
   uint64_t _streamBeginTime_ns = 0;
@@ -100,6 +103,7 @@ public:
   std::vector<int> messages;
 };
 void Processor::CreateStreamJob(CloudMic::StreamType, int, uint32_t id, bool fresh) {
+  if (beforeCreateStreamJob) { beforeCreateStreamJob(); }
   auto job = std::make_shared<MicDataInfo>();
   job->_streamId = id;
   job->fresh = fresh;
@@ -232,6 +236,27 @@ TEST(FollowUpTiming, EarconAndQueuedAudioDoNotAdvertiseCaptureOrStartRequest) {
   mic.StopWakeWordlessStreaming(1);
   EXPECT_FALSE(mic.lights);
   EXPECT_FALSE(mic.states.back().second);
+}
+
+TEST(FollowUpTiming, PendingEarconBlocksWakesUntilFreshCaptureIsInstalled) {
+  MicDataSystem mic;
+  mic.StartWakeWordlessStreaming(CloudMic::StreamType::Normal, false, 1, true);
+  EXPECT_TRUE(mic._wakeWordlessPending);
+  EXPECT_FALSE(mic.HasStreamingJob());
+  mic.StartReadyStream(100);
+  EXPECT_TRUE(mic.messages.empty());
+  EXPECT_FALSE(mic._currentlyStreaming);
+  bool created = false;
+  mic.processor.beforeCreateStreamJob = [&] {
+    created = true;
+    EXPECT_TRUE(mic._wakeWordlessPending);
+    EXPECT_FALSE(mic.HasStreamingJob());
+  };
+  mic.EarconDone();
+  EXPECT_TRUE(created);
+  EXPECT_FALSE(mic._wakeWordlessPending);
+  ASSERT_TRUE(mic.HasStreamingJob());
+  EXPECT_TRUE(mic._currentStreamingJob->IsFreshCapture());
 }
 
 TEST(FollowUpTiming, CancelledEarconCannotReopenAndOfflineCaptureNeverLights) {

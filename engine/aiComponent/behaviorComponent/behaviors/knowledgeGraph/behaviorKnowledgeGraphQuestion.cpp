@@ -119,6 +119,7 @@ namespace Anki
       }
 
       JsonTools::GetValueOptional(config, kKey_CloudAudioEnabled, _iVars.cloudAudioEnabled);
+      JsonTools::GetValueOptional(config, "wakeWordBargeInEnabled", _iVars.wakeWordBargeInEnabled);
       _iVars.multiTurnVoice = config[kKey_MultiTurnVoice];
       JsonTools::GetValueOptional(config, kKey_CloudAudioRequestTimeout, _iVars.cloudAudioRequestTimeout);
       JsonTools::GetValueOptional(config, kKey_CloudAudioReadyTimeout, _iVars.cloudAudioReadyTimeout);
@@ -137,7 +138,9 @@ namespace Anki
       }});
 
       // cloud-audio playback status is reported by the anim process
-      SubscribeToTags({RobotInterface::RobotToEngineTag::audioStreamStatusEvent});
+      SubscribeToTags(std::set<RobotInterface::RobotToEngineTag>{
+          RobotInterface::RobotToEngineTag::audioStreamStatusEvent,
+          RobotInterface::RobotToEngineTag::triggerWordDetected});
     }
 
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -147,6 +150,7 @@ namespace Anki
       expectedKeys.insert(kKey_ReadyStringID);
       expectedKeys.insert(kKey_EarConEnd);
       expectedKeys.insert(kKey_CloudAudioEnabled);
+      expectedKeys.insert("wakeWordBargeInEnabled");
       expectedKeys.insert(kKey_CloudAudioRequestTimeout);
       expectedKeys.insert(kKey_CloudAudioReadyTimeout);
       expectedKeys.insert(kKey_CloudAudioFallback);
@@ -229,6 +233,7 @@ namespace Anki
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
     void BehaviorKnowledgeGraphQuestion::OnBehaviorDeactivated()
     {
+      DisarmWakeWordBargeIn();
       // make sure we cancel the ready utterance if we bail during it playing
       _readyTTSWrapper.CancelUtterance();
       _iVars.ttsBehavior->ClearTextToSay();
@@ -268,6 +273,11 @@ namespace Anki
     {
       if (IsActivated())
       {
+        if (EState::BargeInStopping == _dVars.state || EState::BargeInSettling == _dVars.state)
+        {
+          UpdateWakeWordBargeIn();
+          return;
+        }
         UserIntentComponent &uic = GetBehaviorComp<UserIntentComponent>();
         UserIntentPtr intentDataPtr = uic.GetUserIntentIfActive(USER_INTENT(knowledge_response_bypass));
 
@@ -758,6 +768,13 @@ namespace Anki
 
       // send an initial batch of chunks right away
       UpdateCloudAudioStreaming();
+      if (_iVars.wakeWordBargeInEnabled && !_dVars.cloudAudioResponseFinished &&
+          EResponseSource::CloudAudio == _dVars.responseSource && uic.CanArmWakeWordBargeIn())
+      {
+        _dVars.bargeInStreamId = uic.GetCurrentStreamId();
+        uic.PushWakeWordBargeInResponse(GetDebugLabel(), _dVars.playbackId);
+        _dVars.wakeWordBargeInArmed = true;
+      }
     }
 
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -897,6 +914,9 @@ namespace Anki
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
     void BehaviorKnowledgeGraphQuestion::CancelCloudAudioPlayback()
     {
+      if (EState::BargeInStopping != _dVars.state && EState::BargeInSettling != _dVars.state) {
+        DisarmWakeWordBargeIn();
+      }
       if (_dVars.playbackId != 0) {
         GetBEI().GetRobotInfo().GetSDKComponent().CancelStreamingAudio(_dVars.playbackId);
       }
@@ -916,6 +936,7 @@ namespace Anki
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
     void BehaviorKnowledgeGraphQuestion::FailCloudAudioResponse(bool quiet)
     {
+      DisarmWakeWordBargeIn();
       if (_dVars.cloudAudioResponseFinished)
       {
         return;
@@ -968,6 +989,7 @@ namespace Anki
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
     void BehaviorKnowledgeGraphQuestion::FinishCloudAudioResponse()
     {
+      DisarmWakeWordBargeIn();
       if (_dVars.cloudAudioResponseFinished)
       {
         return;
@@ -1019,8 +1041,23 @@ namespace Anki
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
     void BehaviorKnowledgeGraphQuestion::HandleWhileActivated(const RobotToEngineEvent &event)
     {
+      if (event.GetData().GetTag() == RobotInterface::RobotToEngineTag::triggerWordDetected)
+      {
+        BeginWakeWordBargeIn(event.GetData().Get_triggerWordDetected().bargeInPlaybackId);
+        return;
+      }
       if (event.GetData().GetTag() != RobotInterface::RobotToEngineTag::audioStreamStatusEvent)
       {
+        return;
+      }
+      const auto &statusEvent = event.GetData().Get_audioStreamStatusEvent();
+      if (statusEvent.playbackId != _dVars.playbackId) { return; }
+      if (EState::BargeInStopping == _dVars.state &&
+          (statusEvent.streamResultID == SDKAudioStreamingState::Cancelled ||
+           statusEvent.streamResultID == SDKAudioStreamingState::Completed))
+      {
+        _dVars.state = EState::BargeInSettling;
+        _dVars.bargeInReadyTime = BaseStationTimer::getInstance()->GetCurrentTimeInSecondsDouble() + 0.25;
         return;
       }
       if (EResponseSource::CloudAudio != _dVars.responseSource ||
@@ -1030,8 +1067,6 @@ namespace Anki
         return;
       }
 
-      const auto &statusEvent = event.GetData().Get_audioStreamStatusEvent();
-      if (statusEvent.playbackId != _dVars.playbackId) { return; }
       switch (statusEvent.streamResultID)
       {
       case SDKAudioStreamingState::ChunkAdded:
@@ -1077,6 +1112,71 @@ namespace Anki
     }
 
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    void BehaviorKnowledgeGraphQuestion::DisarmWakeWordBargeIn()
+    {
+      if (_dVars.wakeWordBargeInArmed) {
+        GetBehaviorComp<UserIntentComponent>().PopResponseToTriggerWord(GetDebugLabel());
+        _dVars.wakeWordBargeInArmed = false;
+      }
+    }
+
+    void BehaviorKnowledgeGraphQuestion::BeginWakeWordBargeIn(uint32_t playbackId)
+    {
+      if (!_iVars.wakeWordBargeInEnabled || !_dVars.wakeWordBargeInArmed ||
+          playbackId == 0 || playbackId != _dVars.playbackId ||
+          EState::Responding != _dVars.state || _dVars.cloudAudioResponseFinished ||
+          EResponseSource::CloudAudio != _dVars.responseSource) {
+        return;
+      }
+      auto& uic = GetBehaviorComp<UserIntentComponent>();
+      if (uic.IsMicMuted() || !uic.GetEngineShouldRespondToTriggerWord() ||
+          GetBEI().GetRobotInfo().IsPickedUp() || uic.IsTriggerWordPending() ||
+          uic.IsAnyUserIntentPending() || uic.GetCurrentStreamId() != _dVars.bargeInStreamId) {
+        return;
+      }
+
+      _dVars.state = EState::BargeInStopping;
+      _dVars.bargeInDeadline = BaseStationTimer::getInstance()->GetCurrentTimeInSecondsDouble() + 3.0;
+      GetBehaviorComp<ConversationSessionComponent>().Policy().End("wake_word_barge_in");
+      CancelCloudAudioPlayback();
+      uic.StopConversationStream(_dVars.bargeInStreamId);
+      PRINT_INFO("Wake-word interruption: stopping playback %u and stream %u",
+                 playbackId, _dVars.bargeInStreamId);
+      // Keep the notification-only override until both stop acknowledgements
+      // and the echo tail are past. Repeated wakes must not start old overlap.
+      DelegateIfInControl(new WaitAction(3.0), [this]() {
+        PRINT_NAMED_WARNING("BehaviorKnowledgeGraphQuestion.BargeInTimeout",
+                            "Timed out stopping answer before fresh capture");
+        DisarmWakeWordBargeIn();
+        CancelSelf();
+      });
+    }
+
+    void BehaviorKnowledgeGraphQuestion::UpdateWakeWordBargeIn()
+    {
+      auto& uic = GetBehaviorComp<UserIntentComponent>();
+      const double now = BaseStationTimer::getInstance()->GetCurrentTimeInSecondsDouble();
+      if (uic.IsMicMuted() || !uic.GetEngineShouldRespondToTriggerWord() ||
+          GetBEI().GetRobotInfo().IsPickedUp() || uic.IsTriggerWordPending() ||
+          uic.IsAnyUserIntentPending() ||
+          uic.GetCurrentStreamId() != _dVars.bargeInStreamId || now >= _dVars.bargeInDeadline) {
+        PRINT_NAMED_WARNING("BehaviorKnowledgeGraphQuestion.BargeInAborted",
+                            "Wake interruption lost capture ownership, became unsafe, or timed out");
+        CancelDelegates(false);
+        DisarmWakeWordBargeIn();
+        CancelSelf();
+        return;
+      }
+      if (EState::BargeInSettling == _dVars.state && now >= _dVars.bargeInReadyTime &&
+          uic.IsCaptureQuiescent(_dVars.bargeInStreamId)) {
+        CancelDelegates(false);
+        DisarmWakeWordBargeIn();
+        uic.StartWakeWordBargeInStreaming();
+        _dVars.state = EState::Interrupted;
+        CancelSelf();
+      }
+    }
+
     void BehaviorKnowledgeGraphQuestion::PlayEarconEnd()
     {
       using namespace AudioMetaData::GameEvent;

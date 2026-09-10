@@ -196,8 +196,30 @@ void MicDataProcessor::TriggerWordDetectCallback(TriggerWordDetectSource source,
 {
   ShowAudioStreamStateManager* showStreamState = _context->GetShowAudioStreamStateManager();
   // Ignore extra triggers during streaming
-  if (_micDataSystem->HasStreamingJob() || !showStreamState->HasValidTriggerResponse())
+  if (_micDataSystem->IsMicMuted() || _micDataSystem->HasPendingWakeWordlessStreaming() ||
+      _micDataSystem->HasStreamingJob())
   {
+    return;
+  }
+
+  uint32_t bargeInPlaybackId = 0;
+  const auto bargeIn = showStreamState->ConsumeBargeInTrigger(
+    source == TriggerWordDetectSource::Voice, bargeInPlaybackId);
+  if (bargeIn != ShowAudioStreamStateManager::BargeInDisposition::NotArmed) {
+    if (bargeIn == ShowAudioStreamStateManager::BargeInDisposition::Notify) {
+      RobotInterface::TriggerWordDetected notification;
+      notification.bargeInPlaybackId = bargeInPlaybackId;
+      notification.direction = _micImmediateDirection->GetDominantDirection();
+      notification.triggerScore = static_cast<uint32_t>(info.score);
+      notification.isButtonPress = false;
+      notification.fromMute = false;
+      notification.willOpenStream = false;
+      _micDataSystem->SendMessageToEngine(
+        std::make_unique<RobotInterface::RobotToEngine>(std::move(notification)));
+    }
+    return;
+  }
+  if (!showStreamState->HasValidTriggerResponse()) {
     return;
   }
   

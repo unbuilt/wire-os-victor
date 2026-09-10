@@ -89,6 +89,9 @@ namespace Anki
       void FailCloudAudioResponse(bool quiet = false);
       void FinishCloudAudioResponse();
       void PlaySuccessfulResponseGetOut();
+      void DisarmWakeWordBargeIn();
+      void BeginWakeWordBargeIn(uint32_t playbackId);
+      void UpdateWakeWordBargeIn();
       // decide whether this response should use cloud audio or local TTS
       bool ShouldUseCloudAudio() const;
 
@@ -119,6 +122,8 @@ namespace Anki
         Listening,
         Searching,
         Responding,
+        BargeInStopping,
+        BargeInSettling,
         NoResponse,
         NoConnection,
         Interrupted
@@ -154,6 +159,7 @@ namespace Anki
         // Cloud audio (off by default). When enabled and the cloud advertises audio
         // for a response, the robot plays the cloud-synthesized PCM instead of local TTS.
         bool cloudAudioEnabled = false;
+        bool wakeWordBargeInEnabled = true;
         double cloudAudioRequestTimeout = 65.0; // exceeds vic-cloud's 60s KG request budget
         double cloudAudioReadyTimeout = 5.0;      // seconds to wait for the PCM stream before falling back
         bool cloudAudioFallbackToLocalTts = true; // on error/timeout, speak with local TTS
@@ -195,6 +201,10 @@ namespace Anki
         bool cloudAudioResponseFinished = false; // success get-out already handled
         uint64_t conversationToken = 0;
         uint32_t playbackId = 0;
+        bool wakeWordBargeInArmed = false;
+        uint32_t bargeInStreamId = 0;
+        double bargeInDeadline = 0.0;
+        double bargeInReadyTime = 0.0;
 
       } _dVars;
 

@@ -15,6 +15,7 @@
   "earConAudioEventEnd"     : "Play__Robot_Vic_Sfx__Wake_Word_Success",
 
   "cloudAudioEnabled"           : true,
+  "wakeWordBargeInEnabled"      : true,
   "cloudAudioRequestTimeout"    : 65.0,
   "cloudAudioReadyTimeout"      : 20.0,
   "cloudAudioFallbackToLocalTts": true,

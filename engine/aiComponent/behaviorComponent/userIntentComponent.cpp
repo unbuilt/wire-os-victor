@@ -98,7 +98,11 @@ UserIntentComponent::UserIntentComponent(const Robot& robot, const Json::Value& 
     const auto& twd = event.GetData().Get_triggerWordDetected();
     const bool willStream = twd.willOpenStream;
     const bool muteEdgeCase = twd.fromMute;
-    SetTriggerWordPending(willStream, muteEdgeCase, twd.streamId);
+    // A tagged notification belongs to the answer renderer. KG must stop it
+    // before the normal wake interrupt is allowed to open a new command.
+    if (twd.bargeInPlaybackId == 0) {
+      SetTriggerWordPending(willStream, muteEdgeCase, twd.streamId);
+    }
 
     HandleTriggerWordEventForDas(event.GetData().Get_triggerWordDetected());
   };
@@ -1085,6 +1089,23 @@ void UserIntentComponent::StartFollowUpStreaming(uint32_t streamId)
   _robot->SendMessage(RobotInterface::EngineToRobot(std::move(message)));
 }
 
+void UserIntentComponent::StartWakeWordBargeInStreaming()
+{
+  if (!CanArmWakeWordBargeIn()) {
+    LOG_WARNING("UserIntentComponent.BargeInStreaming.Disabled",
+                "Not opening wake interruption capture without an enabled ordinary wake response");
+    return;
+  }
+  const auto streamId = AllocateStreamId();
+  SetTriggerWordPending(true, false, streamId);
+  RobotInterface::StartWakeWordlessStreaming message;
+  message.streamType = static_cast<uint8_t>(CloudMic::StreamType::Normal);
+  message.playGetInFromAnimProcess = true;
+  message.streamId = streamId;
+  message.freshCapture = true;
+  _robot->SendMessage(RobotInterface::EngineToRobot(std::move(message)));
+}
+
 void UserIntentComponent::StopConversationStream(uint32_t streamId, bool rejectResults)
 {
   {
@@ -1159,6 +1180,25 @@ void UserIntentComponent::PushResponseToTriggerWord(const std::string& id, const
   PushResponseToTriggerWordInternal(id, std::move(msg));
 }
 
+
+void UserIntentComponent::PushWakeWordBargeInResponse(const std::string& id, uint32_t playbackId)
+{
+  RobotInterface::SetTriggerWordResponse message;
+  message.postAudioEvent.audioEvent = AudioMetaData::GameEvent::GenericEvent::Invalid;
+  message.bargeInPlaybackId = playbackId;
+  PushResponseToTriggerWordInternal(id, std::move(message));
+}
+
+bool UserIntentComponent::CanArmWakeWordBargeIn() const
+{
+  if (IsMicMuted() || !GetEngineShouldRespondToTriggerWord() || _responseToTriggerWordMap.empty()) {
+    return false;
+  }
+  const auto& response = _responseToTriggerWordMap.back().response;
+  return response.bargeInPlaybackId == 0 && response.shouldTriggerWordStartStream &&
+         !response.shouldTriggerWordSimulateStream &&
+         response.postAudioEvent.audioEvent != AudioMetaData::GameEvent::GenericEvent::Invalid;
+}
 
 void UserIntentComponent::PopResponseToTriggerWord(const std::string& id)
 {

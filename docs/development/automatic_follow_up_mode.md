@@ -37,6 +37,11 @@ mode, a new ASR model, automatic continuation after arbitrary actions, or
 conversation persistence across restart. No lycopod changes are assumed or
 authorized by this design.
 
+A separate, default-on cloud-answer wake interruption is described in
+[the cloud-audio design](knowledge_graph_cloud_audio_implementation_design.md#wake-word-interruption).
+It ends the current follow-up session and opens a fresh ordinary command;
+it does not change the automatic-follow-up policy described here.
+
 ### Relationship to the earlier design
 
 The broader sequential multi-turn design already proposes a session component

@@ -2,6 +2,7 @@ package voice
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"net/http"
@@ -91,12 +92,16 @@ func TestMaybeSendCloudAudioFetchesPublishedHandle(t *testing.T) {
 type collectSender struct {
 	mu   sync.Mutex
 	msgs []*cloud.Message
+	sent chan *cloud.Message
 }
 
 func (c *collectSender) Send(msg *cloud.Message) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.msgs = append(c.msgs, msg)
+	if c.sent != nil {
+		c.sent <- msg
+	}
 	return nil
 }
 
@@ -106,6 +111,92 @@ func (c *collectSender) snapshot() []*cloud.Message {
 	out := make([]*cloud.Message, len(c.msgs))
 	copy(out, c.msgs)
 	return out
+}
+
+func awaitCloudAudio(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cloud audio worker did not stop promptly")
+	}
+}
+
+func TestCloudAudioCancellationStopsHTTP(t *testing.T) {
+	for _, transport := range []string{"headers", "raw", "framed", "post"} {
+		for _, transition := range []string{"cancel", "cancel-zero", "replace", "replace-zero"} {
+			t.Run(transport+"/"+transition, func(t *testing.T) {
+				request := make(chan context.Context, 1)
+				release := make(chan struct{})
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if transport != "headers" {
+						pcm := makePCM(cloudAudioChunkBytes / 2)
+						if transport == "framed" {
+							w.Header().Set("Content-Type", cloudAudioFramedType)
+							pcm = answerFrame(0, pcm)
+						}
+						w.Write(pcm)
+						w.(http.Flusher).Flush()
+					}
+					request <- r.Context()
+					select {
+					case <-r.Context().Done():
+					case <-release:
+					}
+				}))
+				defer srv.Close()
+				defer close(release)
+				collector := &collectSender{sent: make(chan *cloud.Message, 8)}
+				p := &Process{intents: []MsgSender{collector}}
+				id := uint32(37)
+				if transition == "cancel-zero" || transition == "replace-zero" {
+					id = 0 // Exercise the zero-value Process's initial generation.
+				} else {
+					p.beginAudioOwner(id)
+				}
+				owner := p.getAudioOwner(nil)
+				defer func() { p.cancelAudioOwner(p.getAudioOwner(nil).streamID) }()
+				finished := make(chan struct{})
+				audioID := "audio"
+				if transport == "post" {
+					audioID = ""
+				}
+				go func() {
+					p.sendCloudAudio(srv.URL, "old", audioID, "answer", owner)
+					close(finished)
+				}()
+				var requestCtx context.Context
+				select {
+				case requestCtx = <-request:
+				case <-time.After(2 * time.Second):
+					t.Fatal("HTTP request did not start")
+				}
+				if transport != "headers" {
+					for i := 0; i < 2; i++ {
+						select {
+						case <-collector.sent:
+						case <-time.After(2 * time.Second):
+							t.Fatal("initial PCM was not streamed")
+						}
+					}
+				}
+				before := len(collector.snapshot())
+				switch transition {
+				case "cancel", "cancel-zero":
+					p.cancelAudioOwner(id)
+				case "replace":
+					p.beginAudioOwner(id + 1)
+				case "replace-zero":
+					p.beginAudioOwner(0)
+				}
+				awaitCloudAudio(t, requestCtx.Done())
+				awaitCloudAudio(t, finished)
+				if got := len(collector.snapshot()); got != before {
+					t.Fatalf("cancelled worker emitted late PCM/terminal message: %d -> %d", before, got)
+				}
+			})
+		}
+	}
 }
 
 func makePCM(frames int) []byte {

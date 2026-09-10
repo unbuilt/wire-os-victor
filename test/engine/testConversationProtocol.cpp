@@ -53,6 +53,28 @@ TEST(ConversationProtocol, WakeStreamIdentityReachesEngine)
   EXPECT_EQ(trigger.streamId, RoundTrip(trigger).streamId);
 }
 
+TEST(ConversationProtocol, BargeInResponseAndNotificationAreOptIn)
+{
+  RobotInterface::SetTriggerWordResponse response{};
+  RobotInterface::TriggerWordDetected trigger{};
+  EXPECT_EQ(0u, RoundTrip(response).bargeInPlaybackId);
+  EXPECT_EQ(0u, RoundTrip(trigger).bargeInPlaybackId);
+  response.bargeInPlaybackId = trigger.bargeInPlaybackId = 12345;
+  trigger.willOpenStream = false;
+  trigger.direction = 7;
+  trigger.triggerScore = 93;
+  const auto decodedResponse = RoundTrip(response);
+  EXPECT_EQ(12345u, decodedResponse.bargeInPlaybackId);
+  EXPECT_TRUE(decodedResponse.getInAnimationName.empty());
+  EXPECT_FALSE(decodedResponse.shouldTriggerWordStartStream);
+  const auto decodedTrigger = RoundTrip(trigger);
+  EXPECT_EQ(12345u, decodedTrigger.bargeInPlaybackId);
+  EXPECT_EQ(0u, decodedTrigger.streamId);
+  EXPECT_EQ(7u, decodedTrigger.direction);
+  EXPECT_EQ(93u, decodedTrigger.triggerScore);
+  EXPECT_FALSE(decodedTrigger.willOpenStream);
+}
+
 TEST(ConversationProtocol, RendererCommandsAndCompletionRemainCorrelated)
 {
   RobotInterface::ExternalAudioPrepare prepare;

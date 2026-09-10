@@ -454,6 +454,7 @@ message SetTriggerWordResponse
 {
   AudioEngine::Multiplexer::PostAudioEvent postAudioEvent,
   int_32 minStreamingDuration_ms = -1,
+  uint_32 bargeInPlaybackId = 0,
   bool shouldTriggerWordStartStream = 0,
   bool shouldTriggerWordSimulateStream = 0,
   uint_8 getInAnimationTag = 0,

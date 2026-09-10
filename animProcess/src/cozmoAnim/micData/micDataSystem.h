@@ -27,6 +27,7 @@
 #include "clad/robotInterface/messageRobotToEngine.h"
 #include "clad/types/beatDetectorTypes.h"
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <list>
@@ -106,6 +107,7 @@ public:
 
   void AddMicDataJob(std::shared_ptr<MicDataInfo> newJob, bool isStreamingJob = false);
   bool HasStreamingJob() const;
+  bool HasPendingWakeWordlessStreaming() const { return _wakeWordlessPending.load(); }
   std::deque<std::shared_ptr<MicDataInfo>> GetMicDataJobs() const;
   void UpdateMicJobs();
   void AudioSaveCallback(const std::string& dest);
@@ -174,7 +176,7 @@ private:
   bool _streamingComplete = false;
   uint32_t _pendingStreamId = 0;
   uint64_t _wakeWordlessGeneration = 0;
-  bool _wakeWordlessPending = false;
+  std::atomic<bool> _wakeWordlessPending{false};
 #if ANKI_DEV_CHEATS
   bool _fakeStreamingState = false;
 #endif

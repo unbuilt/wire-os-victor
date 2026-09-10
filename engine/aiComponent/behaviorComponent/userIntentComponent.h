@@ -100,6 +100,7 @@ public:
   void StartWakeWordlessStreaming( CloudMic::StreamType streamType, bool playGetInFromAnimProcess = false );
   void AttachConversation(ConversationSessionComponent* session) { _conversation = session; }
   void StartFollowUpStreaming(uint32_t streamId);
+  void StartWakeWordBargeInStreaming();
   void StopConversationStream(uint32_t streamId, bool rejectResults = true);
   bool IsCaptureQuiescent(uint32_t streamId) const {
     return _captureStateKnown && _captureStreamId == streamId && !_captureOpen;
@@ -141,6 +142,8 @@ public:
                                  StreamAndLightEffect streamAndLightEffect = StreamAndLightEffect::StreamingDisabled,
                                  int32_t minStreamingDuration_ms = -1);
   void PopResponseToTriggerWord(const std::string& id);
+  void PushWakeWordBargeInResponse(const std::string& id, uint32_t playbackId);
+  bool CanArmWakeWordBargeIn() const;
 
   // Copies the current response to the trigger word but overrides the shouldStream and ShouldSimulateStream
   // to match the desired StreamAndLightEffect

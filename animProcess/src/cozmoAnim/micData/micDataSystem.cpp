@@ -320,7 +320,6 @@ void MicDataSystem::StartWakeWordlessStreaming(CloudMic::StreamType type, bool p
     if (generation != _wakeWordlessGeneration || !_wakeWordlessPending) {
       return;
     }
-    _wakeWordlessPending = false;
     // if we didn't succeed, it means that we didn't have a wake word response setup
     if(success && !IsMicMuted()){
       // it would be highly unlikely that we started another streaming job while waiting for the earcon,
@@ -342,6 +341,8 @@ void MicDataSystem::StartWakeWordlessStreaming(CloudMic::StreamType type, bool p
       SetWillStream(false);
       SendMicStreamState(streamId, false);
     }
+    // Keep wake detections blocked until the capture job is visible to their guard.
+    _wakeWordlessPending = false;
   };
 
   ShowAudioStreamStateManager* showStreamState = _context->GetShowAudioStreamStateManager();
@@ -721,8 +722,10 @@ void MicDataSystem::Update(BaseStationTime_t currTime_nanosec)
     {
       RobotInterface::SendAnimToEngine(msg->triggerWordDetected);
 
-      ShowAudioStreamStateManager* showStreamState = _context->GetShowAudioStreamStateManager();
-      SetWillStream(showStreamState->ShouldStreamAfterTriggerWordResponse());
+      if (msg->triggerWordDetected.bargeInPlaybackId == 0) {
+        ShowAudioStreamStateManager* showStreamState = _context->GetShowAudioStreamStateManager();
+        SetWillStream(showStreamState->ShouldStreamAfterTriggerWordResponse());
+      }
     }
     else if (msg->tag == RobotInterface::RobotToEngine::Tag_micDirection)
     {

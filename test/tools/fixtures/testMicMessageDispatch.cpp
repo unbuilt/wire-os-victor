@@ -30,9 +30,10 @@ public:
   void SendMessageToEngine(std::unique_ptr<RobotInterface::RobotToEngine> msgPtr);
   void Dispatch();
   bool IsMicMuted() const { return muted; }
-  void SetWillStream(bool value) { willStream = value; }
+  void SetWillStream(bool value) { willStream = value; ++willStreamUpdates; }
   bool muted = false;
   bool willStream = false;
+  int willStreamUpdates = 0;
   RobotInterface::MicDirection _latestMicDirectionMsg{};
 private:
   Context context;
@@ -106,6 +107,27 @@ TEST_F(MicMessageDispatch, ExistingProducerTypesStillForwardWithSideEffects)
   EXPECT_EQ(123, mic._latestMicDirectionMsg.confidence);
   EXPECT_EQ(Message::Tag_beatDetectorState, RobotInterface::delivered[3].tag);
   EXPECT_TRUE(mic.willStream);
+  EXPECT_EQ(1, mic.willStreamUpdates);
+}
+
+TEST_F(MicMessageDispatch, BargeNotificationDoesNotChangeStreamingLightsAfterOverridePopped)
+{
+  // The display stub already reports the restored ordinary streaming response.
+  for (bool initiallyStreaming : {false, true}) {
+    mic.willStream = initiallyStreaming;
+    RobotInterface::TriggerWordDetected trigger{};
+    trigger.bargeInPlaybackId = 42;
+    trigger.willOpenStream = false;
+    mic.SendMessageToEngine(std::make_unique<Message>(trigger));
+    mic.Dispatch();
+    const auto& delivered = RobotInterface::delivered.back();
+    ASSERT_EQ(Message::Tag_triggerWordDetected, delivered.tag);
+    EXPECT_EQ(42u, delivered.triggerWordDetected.bargeInPlaybackId);
+    EXPECT_FALSE(delivered.triggerWordDetected.willOpenStream);
+    EXPECT_EQ(initiallyStreaming, mic.willStream);
+    EXPECT_EQ(0, mic.willStreamUpdates);
+  }
+  EXPECT_EQ(2u, RobotInterface::delivered.size());
 }
 
 TEST_F(MicMessageDispatch, SuccessfulAnswerQuiescesAndOpensFollowUp)

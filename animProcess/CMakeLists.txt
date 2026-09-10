@@ -11,7 +11,25 @@ include(text2speech)
 include(pryon_lite)
 include(robot_core)
 
+option(SHERPA_KWS "Build the experimental sherpa-onnx keyword spotter" OFF)
+if (SHERPA_KWS)
+  include(sherpa_onnx)
+else()
+  # Do not package stale experimental files when reusing an enabled build tree.
+  file(REMOVE
+    "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/libsherpa-onnx-c-api.so"
+    "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/libonnxruntime.so.1.17.1")
+  file(REMOVE_RECURSE
+    "${CMAKE_BINARY_DIR}/data/assets/cozmo_resources/assets/sherpaKws"
+    "${CMAKE_BINARY_DIR}/data/licenses/sherpaKws")
+endif()
+
 anki_build_cxx_library(victor_anim ${ANKI_SRCLIST_DIR} STATIC)
+target_compile_definitions(victor_anim PUBLIC ANKI_SHERPA_KWS=$<BOOL:${SHERPA_KWS}>)
+if (SHERPA_KWS)
+  target_link_libraries(victor_anim PRIVATE sherpa_onnx_c_api)
+  add_dependencies(victor_anim copy_sherpa_kws)
+endif()
 anki_build_target_license(victor_anim "ANKI" 
                           "Public Domain,${CMAKE_SOURCE_DIR}/lib/util/source/3rd/gif-h/LICENSE" 
                           "Public Domain,${CMAKE_SOURCE_DIR}/lib/util/source/3rd/jo_gif/jo_gif.h" 

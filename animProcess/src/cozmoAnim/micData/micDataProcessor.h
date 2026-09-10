@@ -194,8 +194,10 @@ private:
     RobotTimeStamp_t timestamp;
     uint64_t captureSequence = 0;
     int64_t captureTime_ns = 0;
+    bool vadActive = false;
   };
   Util::FixedCircularBuffer<TimedMicData, kImmediateBufferSize> _immediateAudioBuffer;
+  std::atomic<uint64_t> _minimumTriggerCaptureSequence{0};
 
   using RawAudioChunk = std::array<AudioUtil::AudioSample, kIncomingAudioChunkSize>;
   static constexpr uint32_t kImmediateBufferRawSize = kTriggerAudioLength_ms / kTimePerChunk_ms;

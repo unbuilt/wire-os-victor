@@ -19,6 +19,9 @@
 #include "cozmoAnim/micData/micDataSystem.h"
 #include "cozmoAnim/robotDataLoader.h"
 #include "speechRecognizerPicovoice.h"                        // swapped in Picovoice
+#if defined(ANKI_SHERPA_KWS) && ANKI_SHERPA_KWS
+#include "speechRecognizerSherpaOnnx.h"
+#endif
 #include "cozmoAnim/speechRecognizer/speechRecognizerPryonLite.h"
 #include "cozmoAnim/micData/notchDetector.h"
 #include "util/console/consoleInterface.h"
@@ -28,6 +31,9 @@
 #include "util/fileUtils/fileUtils.h"
 #include "util/logging/logging.h"
 #include <list>
+#include <cerrno>
+#include <cstdlib>
+#include <fstream>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -42,6 +48,31 @@ CONSOLE_VAR_EXTERN(bool, kAlexaEnabledInAU);
   
 namespace {
 #define LOG_CHANNEL "SpeechRecognizer"
+
+bool WantsSherpaWakeWord()
+{
+  const char* setting = std::getenv("ANKI_KWS_BACKEND");
+  std::string backend = setting ? setting : "picovoice";
+  const char* overridePath = "/data/data/com.anki.victor/persistent/kws/backend";
+  errno = 0;
+  std::ifstream overrideFile(overridePath);
+  if (overrideFile.is_open()) {
+    std::string extra;
+    if (!(overrideFile >> backend) || (overrideFile >> extra) || overrideFile.bad()) {
+      LOG_ERROR("SpeechRecognizerSystem.BackendOverride", "Invalid override in %s; using Picovoice", overridePath);
+      return false;
+    }
+  } else if (errno != ENOENT) {
+    LOG_ERROR("SpeechRecognizerSystem.BackendOverride",
+              "Cannot read %s (errno=%d); using Picovoice", overridePath, errno);
+    return false;
+  }
+  if (backend == "sherpa_onnx") { return true; }
+  if (backend != "picovoice") {
+    LOG_ERROR("SpeechRecognizerSystem.Backend", "Unknown backend '%s'; using Picovoice", backend.c_str());
+  }
+  return false;
+}
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 // Console Vars
@@ -289,6 +320,11 @@ SpeechRecognizerSystem::SpeechRecognizerSystem(const Anim::AnimContext* context,
 
 SpeechRecognizerSystem::~SpeechRecognizerSystem()
 {
+#if defined(ANKI_SHERPA_KWS) && ANKI_SHERPA_KWS
+  if (_sherpaRecognizer) {
+    _sherpaRecognizer->Stop();
+  }
+#endif
   if (_victorTrigger) {
     _victorTrigger->recognizer->Stop();
   }
@@ -311,10 +347,35 @@ void SpeechRecognizerSystem::InitVector(const Anim::RobotDataLoader& dataLoader,
   
   const bool useVad = true;
   _victorTrigger = std::make_unique<TriggerContext<SpeechRecognizerPicovoice>>("Vector", useVad);
-  _victorTrigger->recognizer->Init();  
   _victorTrigger->recognizer->SetCallback(callback);
-  //_victorTrigger->recognizer->Start();
   _victorTrigger->micTriggerConfig->Init("hey_vector_thf", dataLoader.GetMicTriggerConfig());
+  bool sherpaReady = false;
+  if (WantsSherpaWakeWord()) {
+#if defined(ANKI_SHERPA_KWS) && ANKI_SHERPA_KWS
+    auto recognizer = std::make_unique<SpeechRecognizerSherpaOnnx>();
+    if (recognizer->Init("/anki/data/assets/cozmo_resources/assets/sherpaKws")) {
+      recognizer->SetCallback([this, callback](const AudioUtil::SpeechRecognizerCallbackInfo& info) {
+        if (!_resetVectorRecognizerPending && !_micDataSystem->IsMicMuted()) {
+          callback(info);
+        }
+      });
+      _sherpaRecognizer = std::move(recognizer);
+      sherpaReady = true;
+    } else {
+      LOG_ERROR("SpeechRecognizerSystem.SherpaInit", "Sherpa initialization failed; falling back to Picovoice");
+    }
+#else
+    LOG_ERROR("SpeechRecognizerSystem.SherpaUnavailable", "Sherpa is not compiled in; using Picovoice");
+#endif
+  }
+  if (!sherpaReady) {
+    _picovoiceReady = _victorTrigger->recognizer->Init();
+    if (!_picovoiceReady) {
+      LOG_ERROR("SpeechRecognizerSystem.PicovoiceInit", "Picovoice initialization failed; voice wake-up unavailable");
+    }
+  }
+  LOG_INFO("SpeechRecognizerSystem.WakeWordBackend", "backend=%s ready=%d",
+           sherpaReady ? "sherpa_onnx" : "picovoice", sherpaReady || _picovoiceReady);
   
 #if ANKI_DEVELOPER_CODE
   const auto& triggerDataList = _victorTrigger->micTriggerConfig->GetAllTriggerModelFiles();
@@ -373,7 +434,28 @@ void SpeechRecognizerSystem::Update(const AudioUtil::AudioSample * audioData, un
     ApplyLocaleUpdate();
   }
   // Update recognizer
-  if (_victorTrigger && (vadActive || !_victorTrigger->useVad)) {
+  const bool resetVector = _resetVectorRecognizerPending.exchange(false);
+  const bool micMuted = _micDataSystem->IsMicMuted();
+#if defined(ANKI_SHERPA_KWS) && ANKI_SHERPA_KWS
+  if (_sherpaRecognizer) {
+    if (resetVector || micMuted) {
+      _sherpaRecognizer->Reset();
+    }
+    if (!micMuted) {
+      _sherpaRecognizer->UpdateWithVad(audioData, audioDataLen, vadActive);
+    }
+    if (_sherpaRecognizer->HasFailed()) {
+      _sherpaRecognizer.reset();
+      _picovoiceReady = _victorTrigger->recognizer->Init();
+      LOG_ERROR("SpeechRecognizerSystem.SherpaRuntime",
+                "Sherpa failed; fallback=picovoice ready=%d", _picovoiceReady);
+    }
+  }
+  else
+#else
+  (void)resetVector;
+#endif
+  if (!micMuted && _picovoiceReady && _victorTrigger && (vadActive || !_victorTrigger->useVad)) {
     _victorTrigger->recognizer->Update(audioData, audioDataLen);
   }
   

@@ -202,6 +202,9 @@ void MicDataSystem::Init(const Anim::RobotDataLoader& dataLoader)
 {
   // SpeechRecognizerSystem
   SpeechRecognizerSystem::TriggerWordDetectedCallback callback = [this] (const AudioUtil::SpeechRecognizerCallbackInfo& info) {
+    if (IsMicMuted()) {
+      return;
+    }
     
  #if ANKI_DEV_CHEATS
     SendTriggerDetectionToWebViz(info, {});
@@ -1016,6 +1019,7 @@ void MicDataSystem::ToggleMicMute()
   // don't feed the raw audio buffer when receiving messages from robot process. Which stops running the mic processor
   // and recognizers methods, therefore, saving CPU. However, mic threads are still runing.
   _micMuted = !_micMuted;
+  _speechRecognizerSystem->ResetVectorRecognizer();
   _micDataProcessor->MuteMics(_micMuted);
   SendMicStreamState(0, false);
   if (_micMuted) {

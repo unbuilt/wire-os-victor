@@ -1,0 +1,14 @@
+--- a/sherpa-onnx/csrc/session.cc
++++ b/sherpa-onnx/csrc/session.cc
+@@ -45,6 +45,11 @@
+ 
+   sess_opts.SetInterOpNumThreads(num_threads);
+ 
++#ifdef SHERPA_ONNX_KWS_DISABLE_SPINNING
++  sess_opts.AddConfigEntry("session.intra_op.allow_spinning", "0");
++  sess_opts.AddConfigEntry("session.inter_op.allow_spinning", "0");
++#endif
++
+   std::vector<std::string> available_providers = Ort::GetAvailableProviders();
+   std::ostringstream os;
+   for (const auto &ep : available_providers) {

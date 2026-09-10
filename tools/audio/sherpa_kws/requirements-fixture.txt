@@ -1,0 +1,2 @@
+# Optional host-only fixture generator, separate from the pinned native KWS runtime.
+sherpa-onnx==1.12.35

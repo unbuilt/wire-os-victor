@@ -1,0 +1,14 @@
+--- a/include/flatbuffers/flatbuffers.h
++++ b/include/flatbuffers/flatbuffers.h
+@@ -1871,10 +1871,7 @@
+     vector_downward &buf_;
+ 
+    private:
+-    TableKeyComparator &operator=(const TableKeyComparator &other) {
+-      buf_ = other.buf_;
+-      return *this;
+-    }
++    TableKeyComparator &operator=(const TableKeyComparator &other) = delete;
+   };
+   /// @endcond
+ 

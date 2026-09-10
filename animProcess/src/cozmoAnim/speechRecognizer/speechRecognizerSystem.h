@@ -41,6 +41,7 @@ namespace Anki {
       class RobotDataLoader;
     }
     class SpeechRecognizerPicovoice;
+    class SpeechRecognizerSherpaOnnx;
     class SpeechRecognizerPryonLite;
     namespace {
       struct TriggerModelTypeData;
@@ -89,6 +90,9 @@ public:
   // Update recognizer audio
   // NOTE: Always call from the same thread
   void Update(const AudioUtil::AudioSample * audioData, unsigned int audioDataLen, bool vadActive);
+
+  // Reset on the recognition thread, even if no audio arrives while muted.
+  void ResetVectorRecognizer() { _resetVectorRecognizerPending = true; }
   
   // Set Default models for locale
   // Use flag to describe what recognizer(s) to updated
@@ -147,6 +151,11 @@ private:
   const Anim::AnimContext*                    _context = nullptr;
   MicData::MicDataSystem*                     _micDataSystem = nullptr;
   std::unique_ptr<TriggerContextPicovoice>          _victorTrigger;
+  bool                                        _picovoiceReady = false;
+  std::atomic_bool                            _resetVectorRecognizerPending{false};
+#if defined(ANKI_SHERPA_KWS) && ANKI_SHERPA_KWS
+  std::unique_ptr<SpeechRecognizerSherpaOnnx>  _sherpaRecognizer;
+#endif
   
   std::unique_ptr<TriggerContextPryon>        _alexaTrigger;
   Alexa*                                      _alexaComponent = nullptr;

@@ -445,6 +445,7 @@ void MicDataProcessor::ProcessRawAudio(RobotTimeStamp_t timestamp,
     nextSample.audioBlock.data(),
     robotStatus,
     robotAngle);
+  nextSample.vadActive = directionResult.activeState != 0;
 
 #ifdef STANDALONE_SIM
   // assume in front of robot if sim
@@ -930,10 +931,14 @@ void MicDataProcessor::ProcessTriggerLoop()
     // Run the trigger detection, which will use the callback defined above
     {
       ANKI_CPU_PROFILE("RecognizeTriggerWord");
-      // Note we skip it if there is no activity as of the latest processed audioblock
-      _speechRecognizerSystem->Update(processedAudio.data(),
-                                      (unsigned int)processedAudio.size(),
-                                      (_micImmediateDirection->GetLatestSample().activeState != 0));
+      // Keep the VAD decision paired with its audio if recognition falls behind.
+      if (readyDataSpot->captureSequence < _minimumTriggerCaptureSequence.load()) {
+        _speechRecognizerSystem->ResetVectorRecognizer();
+      } else {
+        _speechRecognizerSystem->Update(processedAudio.data(),
+                                        (unsigned int)processedAudio.size(),
+                                        readyDataSpot->vadActive);
+      }
     }
 
     // Now we're done using this audio with the recognizer, so let it go
@@ -1035,6 +1040,8 @@ void MicDataProcessor::MuteMics(bool mute)
 {
   std::lock_guard<std::mutex> lock(_rawMicDataMutex);
   _muteMics = mute;
+  // Do not replay pre-mute queues into a fresh recognizer after unmuting.
+  _minimumTriggerCaptureSequence = _captureSequence + 1;
 }
 
 void MicDataProcessor::ResetMicListenDirection()
